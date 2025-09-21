@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 # Keep track of data / history
 HISTORY = []
-
+print("heyyyyyyyyyyyyyyyyyyy")
 class Net(nn.Module):
     def __init__(self):
         super().__init__()

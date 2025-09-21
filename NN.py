@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import evotorch as et
 
+
+print("hey")
 # Define a simple network to evolve
 class Net(nn.Module):
     def __init__(self):
@@ -29,7 +31,7 @@ def fitness(solution):
 # Define search space (genome length = number of parameters in Net)
 dummy_net = Net()
 num_params = sum(p.numel() for p in dummy_net.parameters())
-
+print("hey 2")
 problem = et.Problem(
     "max",         # maximize fitness
     fitness,
@@ -37,7 +39,7 @@ problem = et.Problem(
 )
 
 # Use CMA-ES (Covariance Matrix Adaptation Evolution Strategy)
-searcher = et.CMAES(problem, popsize=20)
+searcher = et.algorithms.CMAES(problem, stdev_init=1.0,popsize=20)
 
 # Run evolution
 for gen in range(10):
