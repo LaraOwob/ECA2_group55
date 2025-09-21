@@ -11,22 +11,144 @@ from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
 
 # import prebuilt robot phenotypes
 from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
+import torch
+import torch.nn as nn
+import evotorch as et
+
+from deap import base, creator, tools
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 # Keep track of data / history
 HISTORY = []
 
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(20, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
 
 
-def controller(model,data,to_track):
-    def sigmoid(x):
-        return 1.0/(1.0 + np.exp(-x))
+def controller(model,data,to_track,solution):
+    # Fitness function: accuracy over a dataset
+    input_size = len(data.qpos)
+    inputs = data.qpos
+    net = Net()
+    et.nn.set_parameters(net, solution)  
+    preds = net(data.qpos).argmax(dim=1)
     
+    data.ctrl = np.clip(preds,-np.pi/2,np.pi/2)
+    HISTORY.append(to_track[0].xpos.copy())
 
-print('what the hell')
+def fitness():
+    net = Net()
+    et.nn.set_parameters(net, solution)  # load genome into model
+    for i in time:
+        controller(net,data,totrack,solution)
+    #result is how fast it went from a to b
+    return result
+        
 
+def algorithm1():
+    #algorithm that just optimizes the weights of the NN
+    # Define search space (genome length = number of parameters in Net)
+    dummy_net = Net()
+    num_params = sum(p.numel() for p in dummy_net.parameters())
+
+    problem = et.Problem(
+        "max",         # maximize fitness
+        fitness,
+        solution_length=num_params
+    )
+
+    # Use CMA-ES (Covariance Matrix Adaptation Evolution Strategy)
+    searcher = et.CMAES(problem, popsize=20)
+
+    # Run evolution
+    for gen in range(10):
+        searcher.step()
+        print(f"Generation {gen+1}, best fitness: {searcher.status['best_fitness']:.4f}")
+
+
+
+
+# Define genome: [num_hidden_layers, size_layer1, size_layer2, activation]
+def random_architecture():
+    num_layers = random.randint(1, 3)
+    layers = [random.randint(4, 32) for _ in range(num_layers)]
+    activation = random.choice(["relu", "tanh"])
+    return [num_layers] + layers + [activation]
+
+# Build a network from genome
+def build_net(genome, input_size, output_size):
+    num_layers = genome[0]
+    layers = []
+    in_features = input_size
     
+    for i in range(num_layers):
+        out_features = genome[i+1]
+        layers.append(nn.Linear(in_features, out_features))
+        if genome[-1] == "relu":
+            layers.append(nn.ReLU())
+        else:
+            layers.append(nn.Tanh())
+        in_features = out_features
     
-    
+    layers.append(nn.Linear(in_features, output_size))
+    return nn.Sequential(*layers)
+
+# Fitness function: evaluate NN performance on task
+def evaluate(genome,data):
+    inputs = len(data.qpos)
+    outputs = 0  #number of hinges
+    net = build_net(genome, input_size=inputs, output_size=outputs)
+    controller()
+    # Run robot simulator here...
+    fitness = random.random()  # fitness calculator 
+    return (fitness,)
+
+def algorithm2():
+    # --- DEAP Setup ---
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+
+    toolbox = base.Toolbox()
+    toolbox.register("individual", tools.initIterate, creator.Individual, random_architecture)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    toolbox.register("evaluate", evaluate)
+    toolbox.register("mate", tools.cxTwoPoint)
+    toolbox.register("mutate", tools.mutShuffleIndexes, indpb=0.2)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    # Evolve
+    pop = toolbox.population(n=10)
+    for gen in range(5):
+        offspring = toolbox.select(pop, len(pop))
+        offspring = list(map(toolbox.clone, offspring))
+        for child1, child2 in zip(offspring[::2], offspring[1::2]):
+            if random.random() < 0.5:
+                toolbox.mate(child1, child2)
+                del child1.fitness.values, child2.fitness.values
+        for mutant in offspring:
+            if random.random() < 0.2:
+                toolbox.mutate(mutant)
+                del mutant.fitness.values
+        invalid = [ind for ind in offspring if not ind.fitness.valid]
+        fitnesses = map(toolbox.evaluate, invalid)
+        for ind, fit in zip(invalid, fitnesses):
+            ind.fitness.values = fit
+        pop[:] = offspring
+
+
+
 def random_move(model, data, to_track) -> None:
     """Generate random movements for the robot's joints.
     

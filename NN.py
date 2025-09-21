@@ -23,6 +23,7 @@ def fitness(solution):
     net = Net()
     et.nn.set_parameters(net, solution)  # load genome into model
     preds = net(X).argmax(dim=1)
+    # a forloop of all the movements
     return (preds == y).float().mean().item()
 
 # Define search space (genome length = number of parameters in Net)
