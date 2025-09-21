@@ -15,6 +15,15 @@ from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 # Keep track of data / history
 HISTORY = []
 
+
+
+def controller(model,data,to_track):
+    def sigmoid(x):
+        return 1.0/(1.0 + np.exp(-x))
+
+    
+    
+    
 def random_move(model, data, to_track) -> None:
     """Generate random movements for the robot's joints.
     
