@@ -21,7 +21,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from ariel.simulation.tasks.targeted_locomotion import distance_to_target
+from ariel.simulation.tasks.targeted_locomotion import distance_to_target
 
 
 
@@ -33,10 +33,14 @@ class Net(nn.Module):
     def __init__(self, input_size, output_size):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(input_size, 64),
+            nn.Linear(input_size, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, output_size),
-            nn.Tanh() 
+            nn.Tanh()
         )
 
     def forward(self, x):
@@ -62,7 +66,7 @@ def controller(model, data, to_track, solution_flat):
     with torch.no_grad():
         output = model(inputs).squeeze()
 
-    print(output)
+    #print("this is the output \n",output)
     data.ctrl = np.clip(output * (np.pi / 2), -np.pi/2, np.pi/2)
     HISTORY.append(to_track[0].xpos.copy())
 
@@ -70,18 +74,24 @@ def controller(model, data, to_track, solution_flat):
 
 def fitness(net, model, solution):
         # Initialize net with random weigths
+        solution = torch.clamp(solution, -3,3)
         set_model_parameters_from_flat(net, solution)
         data_eval = mujoco.MjData(model)
-        start_x = data_eval.qpos[0]
+        
+       
         for _ in range(200):
             obs = torch.tensor(data_eval.qpos, dtype=torch.float32).unsqueeze(0)
             action = net(obs).detach().flatten().tolist()
             data_eval.ctrl[:] = [max(min(a * (np.pi/2), np.pi/2), -np.pi/2) for a in action]
-
             mujoco.mj_step(model, data_eval)
-        return data_eval.qpos[0] - start_x
+        final_pos = data_eval.qpos[:2]  # (x, y) position after 200 steps
+        target = (1.0, 0.0)             # Your target (x, y)
+        dist = distance_to_target(final_pos, target)
+        return -dist  # Negative distance: closer is better
 
-def search_for_weights(model, net, generations=10, popsize=20):
+
+
+def search_for_weights(model, net, generations=50, popsize=20):
     """
     Optimise the parameters of `net` using CMA-ES and return the best solution.
 
@@ -107,30 +117,30 @@ def search_for_weights(model, net, generations=10, popsize=20):
     num_params = sum(p.numel() for p in net.parameters())
     random_sol = torch.randn(num_params)
 
-    fitness_function = fitness(net, model, random_sol)
-    print(fitness_function)
-    print('HAHAHHAHA')
-
+    fitness_function = lambda solution: fitness(net, model, random_sol)
     # --- define the optimisation problem ---
     problem = et.Problem(
         "max",                      # we want to maximise fitness
         fitness_function,
-        solution_length=num_params
+        solution_length=num_params,
+        initial_bounds=(-3, 3)  # keep weights bounded
     )
 
     # --- create CMA-ES searcher ---
-    searcher = et.CMAES(problem, popsize=popsize)
+    searcher = et.algorithms.CMAES(problem, popsize=popsize, stdev_init=1.0)
 
     # --- run the search ---
+    print("generations",generations)
     for gen in range(generations):
         searcher.step()
+        print("this is the searchers dictionary \n",searcher.status)
         print(
             f"Generation {gen+1}/{generations} | "
-            f"best fitness: {searcher.status['best_fitness']:.4f}"
+            f"best fitness: {searcher.status['best_eval']}"
         )
 
     # --- return the best solution ---
-    return searcher.status["best_solution"]
+    return searcher.status["best"].values 
 
 # def fitness():
 #     net = Net()
@@ -345,14 +355,14 @@ def main():
     to_track = [data.bind(geom) for geom in geoms if "core" in geom.name]
 
     input_size = len(data.qpos)
-    output_size = 3
+    output_size = 8
     net = Net(input_size, output_size)
 
    
     
     # 4) search for good weights
-    best_solution = search_for_weights(model, net, generations=10)
-
+    best_solution = search_for_weights(model, net)
+    print("best solution found \n",best_solution)
     # Set the control callback function
     # This is called every time step to get the next action. 
     mujoco.set_mjcb_control(lambda m, d: controller(net, data, to_track, best_solution))
