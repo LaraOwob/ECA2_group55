@@ -33,15 +33,21 @@ class Net(nn.Module):
     def __init__(self, input_size, output_size):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(input_size, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Linear(64, output_size),
-            nn.Tanh()
+            nn.Linear(input_size, 32),
+            nn.Sigmoid(),
+            nn.Linear(32, 32),
+            nn.Sigmoid(),
+            nn.Tanh(),
+            nn.Linear(32, output_size),
         )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.model:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         return self.model(x)
@@ -62,7 +68,7 @@ def controller(model, data, to_track, solution_flat):
   
   # THere is also inbuilt function set_parameters, but that did not work for me
     set_model_parameters_from_flat(model, solution_flat)
-
+    
     with torch.no_grad():
         output = model(inputs).squeeze()
 
@@ -73,25 +79,38 @@ def controller(model, data, to_track, solution_flat):
 
 
 def fitness(net, model, solution):
-        # Initialize net with random weigths
-        solution = torch.clamp(solution, -3,3)
-        set_model_parameters_from_flat(net, solution)
-        data_eval = mujoco.MjData(model)
+    # Clamp solution weights
+    solution = torch.clamp(solution, -3, 3)
+    set_model_parameters_from_flat(net, solution)
+    data_eval = mujoco.MjData(model)
+    target = (1.0, 0.0)  # Target (x, y)
+    num_steps = 200
+    total_reward = 0.0
+    prev_dist = distance_to_target(data_eval.qpos[:2], target)
+    for _ in range(num_steps):
+        obs = torch.tensor(data_eval.qpos, dtype=torch.float32).unsqueeze(0)
+        action = net(obs).detach().flatten().tolist()
+        #print(f"Action values: {action}")
+        data_eval.ctrl[:] = [max(min(a * (np.pi/2), np.pi/2), -np.pi/2) for a in action]
+        mujoco.mj_step(model, data_eval)
+        current_pos = data_eval.qpos[:2]
+        dist = distance_to_target(current_pos, target)
+        # Reward for getting closer
+        progress_bonus = (prev_dist - dist)*2
+        # Strong penalty for being far
+        penalty = -dist*2
+        # Small bonus for moving at all
+        print("the velocity is ", data_eval.actuator_velocity)
         
-       
-        for _ in range(200):
-            obs = torch.tensor(data_eval.qpos, dtype=torch.float32).unsqueeze(0)
-            action = net(obs).detach().flatten().tolist()
-            data_eval.ctrl[:] = [max(min(a * (np.pi/2), np.pi/2), -np.pi/2) for a in action]
-            mujoco.mj_step(model, data_eval)
-        final_pos = data_eval.qpos[:2]  # (x, y) position after 200 steps
-        target = (1.0, 0.0)             # Your target (x, y)
-        dist = distance_to_target(final_pos, target)
-        return -dist  # Negative distance: closer is better
+        movement_bonus = float(np.linalg.norm(data_eval.qvel[:2]) > 1e-3) ** 2
+        total_reward += progress_bonus + movement_bonus
+        prev_dist = dist
+    # Normalize reward
+    return total_reward / num_steps
 
 
 
-def search_for_weights(model, net, generations=50, popsize=20):
+def search_for_weights(model, net, generations=50, popsize=50):
     """
     Optimise the parameters of `net` using CMA-ES and return the best solution.
 
@@ -115,9 +134,7 @@ def search_for_weights(model, net, generations=50, popsize=20):
     """
     # --- count how many parameters the NN has ---
     num_params = sum(p.numel() for p in net.parameters())
-    random_sol = torch.randn(num_params)
-
-    fitness_function = lambda solution: fitness(net, model, random_sol)
+    fitness_function = lambda solution: fitness(net, model, solution)
     # --- define the optimisation problem ---
     problem = et.Problem(
         "max",                      # we want to maximise fitness
@@ -133,7 +150,6 @@ def search_for_weights(model, net, generations=50, popsize=20):
     print("generations",generations)
     for gen in range(generations):
         searcher.step()
-        print("this is the searchers dictionary \n",searcher.status)
         print(
             f"Generation {gen+1}/{generations} | "
             f"best fitness: {searcher.status['best_eval']}"
@@ -299,7 +315,7 @@ def search_for_weights(model, net, generations=50, popsize=20):
     #
     ##############################################
 
-def show_qpos_history(history:list):
+def show_qpos_history(history:list, target=(1.0, 0.0)):
     # Convert list of [x,y,z] positions to numpy array
     pos_data = np.array(history)
     
@@ -310,7 +326,8 @@ def show_qpos_history(history:list):
     plt.plot(pos_data[:, 0], pos_data[:, 1], 'b-', label='Path')
     plt.plot(pos_data[0, 0], pos_data[0, 1], 'go', label='Start')
     plt.plot(pos_data[-1, 0], pos_data[-1, 1], 'ro', label='End')
-    
+    plt.scatter(target[0], target[1], c='magenta', marker='*', s=200, label='Target')  # Add this line
+
     # Add labels and title
     plt.xlabel('X Position')
     plt.ylabel('Y Position') 
@@ -320,7 +337,7 @@ def show_qpos_history(history:list):
     
     # Set equal aspect ratio and center at (0,0)
     plt.axis('equal')
-    max_range = max(abs(pos_data).max(), 0.3)  # At least 1.0 to avoid empty plots
+    max_range = max(abs(pos_data).max(), 2)  # At least 1.0 to avoid empty plots
     plt.xlim(-max_range, max_range)
     plt.ylim(-max_range, max_range)
     
@@ -355,7 +372,8 @@ def main():
     to_track = [data.bind(geom) for geom in geoms if "core" in geom.name]
 
     input_size = len(data.qpos)
-    output_size = 8
+    output_size =model.nu
+    
     net = Net(input_size, output_size)
 
    
