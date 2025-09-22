@@ -28,6 +28,56 @@ from ariel.simulation.tasks.targeted_locomotion import distance_to_target
 
 # Keep track of data / history
 HISTORY = []
+
+
+class NetWithRhythm(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=32, freq_hz=1.0):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.freq_hz = freq_hz
+
+        # input size = state + prev_ctrl + sin + cos
+        input_size = state_dim + action_dim + 2
+
+        self.model = nn.Sequential(
+            nn.Linear(input_size, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.model:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, state, prev_ctrl, t):
+        """Forward pass with rhythmic inputs."""
+        w = 2 * np.pi * self.freq_hz
+        sin_t = np.sin(w * t)
+        cos_t = np.cos(w * t)
+
+        # Build extended observation
+        obs = torch.cat(
+            [state, prev_ctrl, torch.tensor([sin_t, cos_t], dtype=torch.float32)]
+        )
+
+        return self.model(obs)
+
+
+
+
+
+
+
+
+
 # === Neural Network ===
 class Net(nn.Module):
     def __init__(self, input_size, output_size):
@@ -76,6 +126,78 @@ def controller(model, data, to_track, solution_flat):
     data.ctrl = np.clip(output * (np.pi / 2), -np.pi/2, np.pi/2)
     HISTORY.append(to_track[0].xpos.copy())
 
+
+def controller2(net, data, to_track, solution_flat, prev_ctrl, t, dt):
+    # update NN weights
+    set_model_parameters_from_flat(net, solution_flat)
+
+    # build input: state + prev_ctrl + sin/cos(time)
+    state = torch.tensor(data.qpos, dtype=torch.float32)
+    sin_t = torch.tensor([np.sin(2*np.pi*1.0*t)], dtype=torch.float32)
+    cos_t = torch.tensor([np.cos(2*np.pi*1.0*t)], dtype=torch.float32)
+
+    inp = torch.cat([state, prev_ctrl, sin_t, cos_t]).unsqueeze(0)
+
+    with torch.no_grad():
+        action = net(state, prev_ctrl, t).squeeze()
+
+
+    action = torch.clamp(action * (np.pi/2), -np.pi/2, np.pi/2)
+    data.ctrl[:] = action.numpy()
+
+    # update state for next call
+    prev_ctrl = action.detach()
+    t += dt
+
+    HISTORY.append(to_track[0].xpos.copy())
+    return prev_ctrl, t
+
+
+
+def fitness2(net, model, solution):
+    solution = torch.clamp(solution, -3, 3)
+    set_model_parameters_from_flat(net, solution)
+    
+    data_eval = mujoco.MjData(model)
+    target = (1.0, 0.0)  # Target position
+    num_steps = 200
+    total_reward = 0.0
+
+    prev_dist = distance_to_target(data_eval.qpos[:2], target)
+    prev_ctrl = torch.zeros(model.nu)
+    t = 0.0
+    dt = 0.01  # adjust if sim uses different step
+
+    for _ in range(num_steps):
+        state = torch.tensor(data_eval.qpos, dtype=torch.float32)
+        sin_t = torch.tensor([np.sin(2*np.pi*1.0*t)], dtype=torch.float32)
+        cos_t = torch.tensor([np.cos(2*np.pi*1.0*t)], dtype=torch.float32)
+
+        inp = torch.cat([state, prev_ctrl, sin_t, cos_t]).unsqueeze(0)
+
+        with torch.no_grad():
+            action = net(state, prev_ctrl, t).squeeze()
+
+
+        action = torch.clamp(action * (np.pi/2), -np.pi/2, np.pi/2)
+        data_eval.ctrl[:] = action.numpy()
+        mujoco.mj_step(model, data_eval)
+
+        current_pos = data_eval.qpos[:2]
+        dist = distance_to_target(current_pos, target)
+
+        # reward shaping
+        progress_bonus = (prev_dist - dist) * 2
+        penalty = -dist * 2
+        movement_bonus = float(np.linalg.norm(data_eval.qvel[:2]) > 1e-3) * 0.1
+
+        total_reward += progress_bonus + penalty + movement_bonus
+        prev_dist = dist
+
+        prev_ctrl = action.detach()
+        t += dt
+
+    return total_reward / num_steps
 
 
 def fitness(net, model, solution):
@@ -134,7 +256,7 @@ def search_for_weights(model, net, generations=50, popsize=50):
     """
     # --- count how many parameters the NN has ---
     num_params = sum(p.numel() for p in net.parameters())
-    fitness_function = lambda solution: fitness(net, model, solution)
+    fitness_function = lambda solution: fitness2(net, model, solution)
     # --- define the optimisation problem ---
     problem = et.Problem(
         "max",                      # we want to maximise fitness
@@ -364,7 +486,7 @@ def main():
     # These are standard parts of the simulation USE THEM AS IS, DO NOT CHANGE
     model = world.spec.compile()
     data = mujoco.MjData(model) # type: ignore
-
+    
     # Initialise data tracking
     # to_track is automatically updated every time step
     # You do not need to touch it.
@@ -374,16 +496,18 @@ def main():
     input_size = len(data.qpos)
     output_size =model.nu
     
-    net = Net(input_size, output_size)
+    net = NetWithRhythm(input_size, output_size)
 
-   
+    dt = model.opt.timestep
+    prev_ctrl = torch.zeros(model.nu)
+    t = 0.0
     
     # 4) search for good weights
     best_solution = search_for_weights(model, net)
     print("best solution found \n",best_solution)
     # Set the control callback function
     # This is called every time step to get the next action. 
-    mujoco.set_mjcb_control(lambda m, d: controller(net, data, to_track, best_solution))
+    mujoco.set_mjcb_control(lambda m, d: controller2(net, data, to_track, best_solution,prev_ctrl,t,dt))
 
     # This opens a viewer window and runs the simulation with the controller you defined
     # If mujoco.set_mjcb_control(None), then you can control the limbs yourself.
