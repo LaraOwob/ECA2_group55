@@ -11,14 +11,14 @@ import matplotlib.pyplot as plt
 from ariel.utils.renderers import video_renderer
 from ariel.utils.video_recorder import VideoRecorder
 from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
-from ariel.simulation.tasks.targeted_locomotion import distance_to_target
+
 # import prebuilt robot phenotypes
 from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 
 # Keep track of data / history
 HISTORY = []
 CTRL_RANGE = np.pi / 2
-TARGET_POS = np.array([0.7, 0.7, 0.0])  # x,y,z
+
 
 #  BASELINE (Random) 
 def rollout_random_headless(model, data, core_bind, T=10.0, rng=None):
@@ -147,8 +147,7 @@ def show_qpos_history(history:list):
     plt.plot(pos_data[:, 0], pos_data[:, 1], 'b-', label='Path')
     plt.plot(pos_data[0, 0], pos_data[0, 1], 'go', label='Start')
     plt.plot(pos_data[-1, 0], pos_data[-1, 1], 'ro', label='End')
-    plt.scatter(TARGET_POS[0], TARGET_POS[1], c='magenta', marker='*', s=200, label='Target')  # Add this line
-
+    
     # Add labels and title
     plt.xlabel('X Position')
     plt.ylabel('Y Position') 
@@ -158,7 +157,7 @@ def show_qpos_history(history:list):
     
     # Set equal aspect ratio and center at (0,0)
     plt.axis('equal')
-    max_range = max(abs(pos_data).max(), 2)  # At least 1.0 to avoid empty plots
+    max_range = max(abs(pos_data).max(), 0.3)  # At least 1.0 to avoid empty plots
     plt.xlim(-max_range, max_range)
     plt.ylim(-max_range, max_range)
     
@@ -190,7 +189,7 @@ class MLPController:
     def __init__(self, nu: int, hidden: int = 32, freq_hz: float = 1.0):
         self.nu = nu
         self.hidden = hidden
-        self.in_dim = nu + 4
+        self.in_dim = nu + 2
         self.out_dim = nu
         self.freq_hz = freq_hz
         # Parameter shapes
@@ -218,17 +217,9 @@ class MLPController:
         b2 = t[i:i+self.out_dim]
         return W1, b1, W2, b2
 
-    def forward(self, prev_ctrl: np.ndarray, t: float, target_pos: np.ndarray, current_pos: np.ndarray) -> np.ndarray:
+    def forward(self, prev_ctrl: np.ndarray, t: float) -> np.ndarray:
         w = 2*np.pi*self.freq_hz
-        # relative position to target
-        # inside MLPController.forward
-        delta = target_pos[:2] - current_pos[:2]  # x,y only
-        dist_to_target = np.linalg.norm(delta)
-        if dist_to_target < 0.05:  # threshold to "stop"
-            delta = np.zeros_like(delta)  # tell MLP: no more movement
-        else:
-            delta = delta / 1.0  # normalize
-        obs = np.concatenate([prev_ctrl, [np.sin(w*t), np.cos(w*t)], delta], dtype=np.float64)
+        obs = np.concatenate([prev_ctrl, [np.sin(w*t), np.cos(w*t)]], dtype=np.float64)
         W1, b1, W2, b2 = self._unpack()
         h = np.tanh(obs @ W1 + b1)
         y = np.tanh(h @ W2 + b2)  # in [-1,1]
@@ -241,9 +232,8 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     alpha: smoothing factor for actions (0=no smoothing, 1=full new action).
     """
     mujoco.set_mjcb_control(None)
-    data_eval = mujoco.MjData(model)
-    mujoco.mj_resetData(model, data_eval)
-    
+    mujoco.mj_resetData(model, data)
+
     dt = float(model.opt.timestep)
     steps = int(T / dt)
     nu = model.nu
@@ -251,40 +241,30 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     ctrlr = MLPController(nu, hidden=hidden, freq_hz=freq_hz)
     ctrlr.set_params(theta)
     prev = np.zeros(nu, dtype=np.float64)
-    start_pos = data_eval.xpos[core_bind.id].copy()
-    prev_dist = np.linalg.norm(start_pos - TARGET_POS)
-    
+
+    x0 = float(core_bind.xpos[0])
     energy_acc = 0.0
     dctrl_acc = 0.0
-    progress_reward = 0.0
-    x0 = float(core_bind.xpos[0])
+
     for k in range(steps):
         t = k * dt
-        current_pos = data_eval.xpos[core_bind.id]
-        raw = ctrlr.forward(prev, t,TARGET_POS,current_pos)
+        raw = ctrlr.forward(prev, t)
         ctrl = (1 - alpha) * prev + alpha * raw
         ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
-        
         dctrl_acc += float(np.mean(np.abs(ctrl - prev)))
         energy_acc += float(np.mean(np.abs(ctrl)))
-        
         prev = ctrl
-        data_eval.ctrl[:] = ctrl
-        mujoco.mj_step(model, data_eval)
+        data.ctrl[:] = ctrl
+        mujoco.mj_step(model, data)
         if not np.isfinite(core_bind.xpos[0]):
             return 1e6  # big loss on crash
 
-    # final position
-    current_pos = data_eval.xpos[core_bind.id]
-    dist = np.linalg.norm(current_pos - TARGET_POS)
-    
-    progress_reward = (prev_dist - dist)/steps
-    dx = float(current_pos[0] -start_pos[0])
+    dx = float(core_bind.xpos[0] - x0)
     lam_energy = 0.01
     lam_smooth = 0.01
     energy = energy_acc / steps
     smooth = dctrl_acc / steps
-    fitness = dx - lam_energy * energy - lam_smooth * smooth - progress_reward*lam_smooth
+    fitness = dx - lam_energy * energy - lam_smooth * smooth
     return -float(fitness)  # minimize loss
 
 def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0.2, dt=0.01):
@@ -292,7 +272,6 @@ def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0
     step_k = {'k': 0}
     ctrlr_cache = {'ctrlr': None}
     prev = np.zeros(1, dtype=np.float64)  # resized on first call
-
     def cb(model, data):
         nonlocal prev
         if ctrlr_cache['ctrlr'] is None:
@@ -301,14 +280,10 @@ def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0
             ctrlr_cache['ctrlr'].set_params(theta)
             prev = np.zeros(nu, dtype=np.float64)
         k = step_k['k']; t = k * dt
-        current_pos = to_track[0].xpos.copy()  # shape (3,) for x,y,z
-
-        raw = ctrlr_cache['ctrlr'].forward(prev, t,TARGET_POS,current_pos)
+        raw = ctrlr_cache['ctrlr'].forward(prev, t)
         ctrl = (1 - alpha) * prev + alpha * raw
         ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
         data.ctrl[:] = ctrl
-        
-        #dist = distance_to_target(current_pos, TARGET_POS)
         HISTORY.append(to_track[0].xpos.copy())
         prev[:] = ctrl
         step_k['k'] = k + 1
@@ -317,7 +292,7 @@ def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0
 
 # CMA-ES on MLP (1a) 
 
-def train_mlp_cma(out_csv, generations=100, pop_size=None, T=10.0, seed=0, model=None, data=None, core_bind=None,
+def train_mlp_cma(out_csv, generations=200, pop_size=None, T=10.0, seed=0, model=None, data=None, core_bind=None,
                   hidden=32, freq_hz=1.0, sigma0=0.5, alpha=0.2):
     """CMA-ES optimization of MLP weights. Logs per-generation best/mean/median fitness. Returns (best_theta, best_fitness)."""
     try:
@@ -330,7 +305,7 @@ def train_mlp_cma(out_csv, generations=100, pop_size=None, T=10.0, seed=0, model
     n_params = ctrlr.n_params
     if pop_size is None:
         pop_size = int(4 + np.floor(3 * np.log(n_params)))
-    print("the pop size is", pop_size)
+
     x0 = np.zeros(n_params, dtype=np.float64)
     es = cma.CMAEvolutionStrategy(x0, sigma0, {'popsize': pop_size, 'seed': seed})
 
@@ -372,7 +347,7 @@ def train_mlp_cma(out_csv, generations=100, pop_size=None, T=10.0, seed=0, model
 
 #  Differential Evolution on MLP (1b)
 
-def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=None, data=None, core_bind=None,
+def train_mlp_de(out_csv, generations=200, pop_size=30, T=10.0, seed=0, model=None, data=None, core_bind=None,
                  hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, alpha=0.2):
     """
     Simple, dependency-free Differential Evolution (DE/rand/1/bin) for MLP params.
@@ -602,7 +577,7 @@ def train_mlp_ga(out_csv, generations=200, pop_size=60, T=10.0, seed=0, model=No
 
     nu = model.nu
     n_params = MLPController(nu, hidden=hidden, freq_hz=freq_hz).n_params
-    print("this is the mlp ga with generations ", generations)
+
     # Safe creator (avoid duplicate class creation on re-runs)
     try:
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -751,7 +726,7 @@ def plot_experiment(exp_name, exp_csvs, rand_csvs, out_png, window=10, title=Non
 
 
 def main(experiment,
-         generations=60, pop_size=24, T=10.0, seed=[0,1,2],
+         generations=200, pop_size=24, T=10.0, seed=[0,1,2],
          # MLP hyperparams
          mlp_hidden=32, cma_sigma0=0.7, mlp_freq_hz=1.0, mlp_alpha=0.25,
          # DE hyperparams
@@ -784,15 +759,7 @@ def main(experiment,
     # Spawn robot in the world
     # Check docstring for spawn conditions
     world.spawn(gecko_core.spec, spawn_position=[0, 0, 0])
-    world.spec.worldbody.add_geom(
-    type=mujoco.mjtGeom.mjGEOM_SPHERE,
-    name="target_marker",
-    size=[0.05, 0.0, 0.0],          # radius of sphere
-    pos=TARGET_POS, # your TARGET_POS
-    rgba=[1, 0, 0, 1],    # red, opaque
-    contype=0,            # no collisions
-    conaffinity=0
-    )
+    
     # Generate the model and data
     # These are standard parts of the simulation USE THEM AS IS, DO NOT CHANGE
     model = world.spec.compile()
@@ -806,7 +773,7 @@ def main(experiment,
 
     core_bind = to_track[0]
     dt = float(model.opt.timestep)
-    print("in main and we have generations", generations)
+
     # Run random baseline experiment
     if experiment == "baseline":
         for s in seed:
@@ -903,7 +870,7 @@ def main(experiment,
             cb = mlp_viewer_callback_factory(best_theta_viz, to_track, hidden=mlp_hidden, freq_hz=mlp_freq_hz, alpha=mlp_alpha, dt=dt)
             mujoco.set_mjcb_control(cb)
             viewer.launch(model=model, data=data)
-           
+
         show_qpos_history(HISTORY)
         return
 
@@ -975,7 +942,7 @@ def main(experiment,
     # )
 
 if __name__ == "__main__":
-    experiment = "mlp_ga"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
+    experiment = "mlp_cma"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
     main(experiment=experiment)
 
 
