@@ -147,7 +147,8 @@ def show_qpos_history(history:list):
     plt.plot(pos_data[:, 0], pos_data[:, 1], 'b-', label='Path')
     plt.plot(pos_data[0, 0], pos_data[0, 1], 'go', label='Start')
     plt.plot(pos_data[-1, 0], pos_data[-1, 1], 'ro', label='End')
-    
+    plt.scatter(TARGET_POS[0], TARGET_POS[1], c='magenta', marker='*', s=200, label='Target')  # Add this line
+
     # Add labels and title
     plt.xlabel('X Position')
     plt.ylabel('Y Position') 
@@ -157,7 +158,7 @@ def show_qpos_history(history:list):
     
     # Set equal aspect ratio and center at (0,0)
     plt.axis('equal')
-    max_range = max(abs(pos_data).max(), 0.3)  # At least 1.0 to avoid empty plots
+    max_range = max(abs(pos_data).max(), 2)  # At least 1.0 to avoid empty plots
     plt.xlim(-max_range, max_range)
     plt.ylim(-max_range, max_range)
     
@@ -232,8 +233,9 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     alpha: smoothing factor for actions (0=no smoothing, 1=full new action).
     """
     mujoco.set_mjcb_control(None)
-    mujoco.mj_resetData(model, data)
     data_eval = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+    
     dt = float(model.opt.timestep)
     steps = int(T / dt)
     nu = model.nu
@@ -241,35 +243,39 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     ctrlr = MLPController(nu, hidden=hidden, freq_hz=freq_hz)
     ctrlr.set_params(theta)
     prev = np.zeros(nu, dtype=np.float64)
-    prev_dist = distance_to_target(prev, TARGET_POS)
-
-    x0 = float(core_bind.xpos[0])
+    start_pos = core_bind.xpos.copy()
+    prev_dist = np.linalg.norm(start_pos - TARGET_POS)
+    
     energy_acc = 0.0
     dctrl_acc = 0.0
     progress_reward = 0.0
+    
     for k in range(steps):
         t = k * dt
         raw = ctrlr.forward(prev, t)
         ctrl = (1 - alpha) * prev + alpha * raw
         ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
+        
         dctrl_acc += float(np.mean(np.abs(ctrl - prev)))
         energy_acc += float(np.mean(np.abs(ctrl)))
         
         prev = ctrl
         data.ctrl[:] = ctrl
-        mujoco.mj_step(model, data)
+        mujoco.mj_step(model, data_eval)
         if not np.isfinite(core_bind.xpos[0]):
             return 1e6  # big loss on crash
 
-    current_pos = data_eval.qpos
-    dist = distance_to_target(current_pos, TARGET_POS)
+    # final position
+    current_pos = core_bind.xpos
+    dist = np.linalg.norm(current_pos - TARGET_POS)
+    
     progress_reward = (prev_dist - dist)/steps
-    dx = float(core_bind.xpos[0] - x0)
+    dx = float(core_bind.xpos[0] - start_pos[0])
     lam_energy = 0.01
     lam_smooth = 0.01
     energy = energy_acc / steps
     smooth = dctrl_acc / steps
-    fitness = dx - lam_energy * energy - lam_smooth * smooth -progress_reward
+    fitness = dx - lam_energy * energy - lam_smooth * smooth #- progress_reward*lam_smooth
     return -float(fitness)  # minimize loss
 
 def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0.2, dt=0.01):
@@ -277,6 +283,7 @@ def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0
     step_k = {'k': 0}
     ctrlr_cache = {'ctrlr': None}
     prev = np.zeros(1, dtype=np.float64)  # resized on first call
+
     def cb(model, data):
         nonlocal prev
         if ctrlr_cache['ctrlr'] is None:
@@ -289,6 +296,8 @@ def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0
         ctrl = (1 - alpha) * prev + alpha * raw
         ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
         data.ctrl[:] = ctrl
+        
+        #dist = distance_to_target(current_pos, TARGET_POS)
         HISTORY.append(to_track[0].xpos.copy())
         prev[:] = ctrl
         step_k['k'] = k + 1
@@ -764,7 +773,15 @@ def main(experiment,
     # Spawn robot in the world
     # Check docstring for spawn conditions
     world.spawn(gecko_core.spec, spawn_position=[0, 0, 0])
-    
+    world.spec.worldbody.add_geom(
+    type=mujoco.mjtGeom.mjGEOM_SPHERE,
+    name="target_marker",
+    size=[0.05, 0.0, 0.0],          # radius of sphere
+    pos=TARGET_POS, # your TARGET_POS
+    rgba=[1, 0, 0, 1],    # red, opaque
+    contype=0,            # no collisions
+    conaffinity=0
+    )
     # Generate the model and data
     # These are standard parts of the simulation USE THEM AS IS, DO NOT CHANGE
     model = world.spec.compile()
@@ -875,7 +892,7 @@ def main(experiment,
             cb = mlp_viewer_callback_factory(best_theta_viz, to_track, hidden=mlp_hidden, freq_hz=mlp_freq_hz, alpha=mlp_alpha, dt=dt)
             mujoco.set_mjcb_control(cb)
             viewer.launch(model=model, data=data)
-
+           
         show_qpos_history(HISTORY)
         return
 
@@ -947,7 +964,7 @@ def main(experiment,
     # )
 
 if __name__ == "__main__":
-    experiment = "mlp_cma"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
+    experiment = "mlp_ga"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
     main(experiment=experiment)
 
 
