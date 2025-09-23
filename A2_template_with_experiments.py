@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from ariel.utils.renderers import video_renderer
 from ariel.utils.video_recorder import VideoRecorder
 from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
-
+from ariel.simulation.tasks.targeted_locomotion import distance_to_target
 # import prebuilt robot phenotypes
 from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 
@@ -241,11 +241,12 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     ctrlr = MLPController(nu, hidden=hidden, freq_hz=freq_hz)
     ctrlr.set_params(theta)
     prev = np.zeros(nu, dtype=np.float64)
+    prev_dist = distance_to_target(prev, TARGET_POS)
 
     x0 = float(core_bind.xpos[0])
     energy_acc = 0.0
     dctrl_acc = 0.0
-
+    progress_reward = 0.0
     for k in range(steps):
         t = k * dt
         raw = ctrlr.forward(prev, t)
@@ -253,18 +254,22 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
         ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
         dctrl_acc += float(np.mean(np.abs(ctrl - prev)))
         energy_acc += float(np.mean(np.abs(ctrl)))
+        
         prev = ctrl
         data.ctrl[:] = ctrl
         mujoco.mj_step(model, data)
         if not np.isfinite(core_bind.xpos[0]):
             return 1e6  # big loss on crash
 
+    current_pos = data_eval.qpos
+    dist = distance_to_target(current_pos, TARGET_POS)
+    progress_reward = (prev_dist - dist)/steps
     dx = float(core_bind.xpos[0] - x0)
     lam_energy = 0.01
     lam_smooth = 0.01
     energy = energy_acc / steps
     smooth = dctrl_acc / steps
-    fitness = dx - lam_energy * energy - lam_smooth * smooth
+    fitness = dx - lam_energy * energy - lam_smooth * smooth -progress_reward
     return -float(fitness)  # minimize loss
 
 def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0.2, dt=0.01):
