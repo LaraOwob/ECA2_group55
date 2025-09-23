@@ -18,8 +18,8 @@ from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 # Keep track of data / history
 HISTORY = []
 CTRL_RANGE = np.pi / 2
-TARGET_POS = np.array([0.7, 0.7, 0.0])  # x,y,z
-
+TARGET_POS = np.array([0.7, 0.3, 0.1])  # x,y,z
+TOLERANCE = 0.3  # distance to target to be considered "reached"
 #  BASELINE (Random) 
 def rollout_random_headless(model, data, core_bind, T=10.0, rng=None):
     """One headless episode with step-wise random actions; returns a scalar fitness."""
@@ -224,10 +224,8 @@ class MLPController:
         # inside MLPController.forward
         delta = target_pos[:2] - current_pos[:2]  # x,y only
         dist_to_target = np.linalg.norm(delta)
-        if dist_to_target < 0.05:  # threshold to "stop"
-            delta = np.zeros_like(delta)  # tell MLP: no more movement
-        else:
-            delta = delta / 1.0  # normalize
+        if dist_to_target < TOLERANCE:  # threshold to "stop"
+            print("Reached target!")
         obs = np.concatenate([prev_ctrl, [np.sin(w*t), np.cos(w*t)], delta], dtype=np.float64)
         W1, b1, W2, b2 = self._unpack()
         h = np.tanh(obs @ W1 + b1)
@@ -252,12 +250,13 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     ctrlr.set_params(theta)
     prev = np.zeros(nu, dtype=np.float64)
     start_pos = data_eval.xpos[core_bind.id].copy()
-    prev_dist = np.linalg.norm(start_pos - TARGET_POS)
+    initial_dist = np.linalg.norm(start_pos - TARGET_POS)
     
     energy_acc = 0.0
     dctrl_acc = 0.0
     progress_reward = 0.0
-    x0 = float(core_bind.xpos[0])
+    reached =False
+    time_to_target = None
     for k in range(steps):
         t = k * dt
         current_pos = data_eval.xpos[core_bind.id]
@@ -268,23 +267,35 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
         dctrl_acc += float(np.mean(np.abs(ctrl - prev)))
         energy_acc += float(np.mean(np.abs(ctrl)))
         
+        
         prev = ctrl
         data_eval.ctrl[:] = ctrl
         mujoco.mj_step(model, data_eval)
+        
+        dist = np.linalg.norm(current_pos - TARGET_POS)
+        if dist <TOLERANCE:
+            reached = True
+            time_to_target = k*dt
+        
         if not np.isfinite(core_bind.xpos[0]):
             return 1e6  # big loss on crash
+    if reached:
+        # penalty for movement after reaching
+        extra_movement = energy_acc / steps  # or np.mean(np.abs(ctrl)) after reaching
+        fitness = 1000.0 + (T - time_to_target) * 100.0 - 50.0 * extra_movement  # big bonus for reaching target quickly
+        print(f"Reached target in {time_to_target:.2f}s, fitness {fitness:.2f}")
 
-    # final position
-    current_pos = data_eval.xpos[core_bind.id]
-    dist = np.linalg.norm(current_pos - TARGET_POS)
-    
-    progress_reward = (prev_dist - dist)/steps
-    dx = float(current_pos[0] -start_pos[0])
-    lam_energy = 0.01
-    lam_smooth = 0.01
-    energy = energy_acc / steps
-    smooth = dctrl_acc / steps
-    fitness = dx - lam_energy * energy - lam_smooth * smooth - progress_reward*lam_smooth
+    else:
+        # final position
+        current_pos = data_eval.xpos[core_bind.id]
+        final_dist = np.linalg.norm(current_pos - TARGET_POS)
+        progress_reward = (initial_dist - final_dist)/steps
+        dx = float(current_pos[0] -start_pos[0])
+        lam_energy = 0.01
+        lam_smooth = 0.01
+        energy = energy_acc / steps
+        smooth = dctrl_acc / steps
+        fitness = dx - lam_energy * energy - lam_smooth * smooth - progress_reward*lam_smooth
     return -float(fitness)  # minimize loss
 
 def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0.2, dt=0.01):
@@ -307,8 +318,8 @@ def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0
         ctrl = (1 - alpha) * prev + alpha * raw
         ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
         data.ctrl[:] = ctrl
-        
-        #dist = distance_to_target(current_pos, TARGET_POS)
+        final_dist = np.linalg.norm(current_pos - TARGET_POS)
+        print(f"Step {k}, pos {current_pos}, dist to target {final_dist:.3f}")
         HISTORY.append(to_track[0].xpos.copy())
         prev[:] = ctrl
         step_k['k'] = k + 1
@@ -751,7 +762,7 @@ def plot_experiment(exp_name, exp_csvs, rand_csvs, out_png, window=10, title=Non
 
 
 def main(experiment,
-         generations=60, pop_size=24, T=10.0, seed=[0,1,2],
+         generations=200, pop_size=24, T=10.0, seed=[0,1,2],
          # MLP hyperparams
          mlp_hidden=32, cma_sigma0=0.7, mlp_freq_hz=1.0, mlp_alpha=0.25,
          # DE hyperparams
