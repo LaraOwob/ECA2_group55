@@ -233,7 +233,7 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     """
     mujoco.set_mjcb_control(None)
     mujoco.mj_resetData(model, data)
-
+    data_eval = mujoco.MjData(model)
     dt = float(model.opt.timestep)
     steps = int(T / dt)
     nu = model.nu
