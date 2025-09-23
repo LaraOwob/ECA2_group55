@@ -18,7 +18,7 @@ from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 # Keep track of data / history
 HISTORY = []
 CTRL_RANGE = np.pi / 2
-
+TARGET_POS = np.array([1.0, 0.0, 0.0])  # x,y,z
 
 #  BASELINE (Random) 
 def rollout_random_headless(model, data, core_bind, T=10.0, rng=None):
@@ -305,7 +305,7 @@ def train_mlp_cma(out_csv, generations=100, pop_size=None, T=10.0, seed=0, model
     n_params = ctrlr.n_params
     if pop_size is None:
         pop_size = int(4 + np.floor(3 * np.log(n_params)))
-
+    print("the pop size is", pop_size)
     x0 = np.zeros(n_params, dtype=np.float64)
     es = cma.CMAEvolutionStrategy(x0, sigma0, {'popsize': pop_size, 'seed': seed})
 
@@ -942,7 +942,7 @@ def main(experiment,
     # )
 
 if __name__ == "__main__":
-    experiment = "plot"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
+    experiment = "mlp_cma"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
     main(experiment=experiment)
 
 
