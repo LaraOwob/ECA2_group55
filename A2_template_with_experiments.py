@@ -555,7 +555,7 @@ def plot_experiment(exp_name, exp_csvs, rand_csvs, rand_label, final_exp ,out_pn
 
 
 def main(experiment,
-         generations = 5, pop_size=24, T=10.0, seed=[0,1,2],
+         generations = 200, pop_size=24, T=10.0, seed=[0,1,2],
          mlp_hidden=32, mlp_freq_hz=1.0, mlp_alpha=0.25,
          de_F=0.7, de_CR=0.9, de_init_scale=0.5,
          ga_cxpb=0.6, ga_mutpb=0.3, ga_mut_sigma=0.3,    
@@ -653,7 +653,7 @@ def main(experiment,
                 out_csv=out_csv, generations=generations, pop_size=max(pop_size, 40), T=T, seed=s,
                 model=model, data=data, core_bind=core_bind,
                 hidden=mlp_hidden, freq_hz=mlp_freq_hz,
-                cxpb=ga_cxpb, mutpb=ga_mutpb, mut_sigma=ga_mut_sigma, alpha=mlp_alpha
+                crossover_prob=ga_cxpb, mutation_prob=ga_mutpb, mut_sigma=ga_mut_sigma, alpha=mlp_alpha
             )
             print(f"[mlp_ga seed {s}] best_fitness={best_fit:.3f}")
             if i == 0: best_theta_viz = theta
@@ -741,7 +741,7 @@ def main(experiment,
     # )
 
 if __name__ == "__main__":
-    experiment = "plot"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
+    experiment = "mlp_de"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
     main(experiment=experiment)
 
 
