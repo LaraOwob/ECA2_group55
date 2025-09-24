@@ -53,14 +53,56 @@ def run_ttest():
 #  BASELINE (Random) 
 def run_random_baseline(out_csv, generations=200, pop_size=32, T=10.0, seed=0, model=None, data=None, to_track=None):
     """Evaluate pop_size random rollouts per generation; log best/mean/median to CSV."""
-    rng = np.random.default_rng(seed)
 
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     with open(out_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
         for g in range(generations):
-            fits = [random_move(model, data, to_track) for _ in range(pop_size)]      
+            fits = []
+            prev = np.zeros(model.nu, dtype=np.float64)
+            start_pos = to_track[0].xpos.copy()
+            initial_dist = np.linalg.norm(start_pos - TARGET_POS)
+            dctrl_acc = 0.0
+            progress_reward = 0.0
+            reached =False
+            time_to_target = None
+            energy_acc = 0.0
+            dt = float(model.opt.timestep)
+            steps = int(T / dt)
+            current_pos = start_pos
+            for k in range(pop_size):
+                t = k * dt
+                current_pos, ctrl = random_move(model,data,to_track)
+                dctrl_acc += float(np.mean(np.abs(ctrl - prev)))
+                energy_acc += float(np.mean(np.abs(ctrl)))
+                prev = ctrl
+                mujoco.mj_step(model, data)
+        
+                dist = np.linalg.norm(current_pos - TARGET_POS)
+                if dist <TOLERANCE:
+                    reached = True
+                    time_to_target = k*dt
+                if not np.isfinite(current_pos[0]):
+                    return 1e6  # big loss on crash
+            if reached:
+                # penalty for movement after reaching
+                extra_movement = energy_acc / steps  
+                # big bonus for reaching target quickly
+                fitness = 1.0 + (T - time_to_target)/T  -  extra_movement  
+
+            else:
+                #if target not reached, calculate fitness based on distance to target
+                final_dist = np.linalg.norm(current_pos - TARGET_POS)
+                progress_reward = (initial_dist - final_dist)/steps
+                dx = float(current_pos[0] -start_pos[0])
+                lam_energy = 0.01
+                lam_smooth = 0.01
+                energy = energy_acc / steps
+                smooth = dctrl_acc / steps
+                fitness = dx - lam_energy * energy - lam_smooth * smooth - progress_reward*lam_smooth
+
+            fits.append(fitness)   
             best, mean, median = float(np.max(fits)), float(np.mean(fits)), float(np.median(fits))
             writer.writerow([g, best, mean, median])
             if (g + 1) % max(1, generations // 10) == 0:
@@ -108,13 +150,14 @@ def random_move(model, data, to_track) -> None:
     # Bound the control values to be within the hinge limits.
     # If a value goes outside the bounds it might result in jittery movement.
     data.ctrl = np.clip(data.ctrl, -np.pi/2, np.pi/2)
-
+    current_pos = to_track[0].xpos.copy()
     # Save movement to history
-    HISTORY.append(to_track[0].xpos.copy())
+    HISTORY.append(current_pos)
     
-    final_pos =  to_track[0].xpos.copy()
-    fitness = -np.linalg.norm( final_pos - TARGET_POS)
-    return - float(fitness)
+    return current_pos, data.ctrl
+
+
+
     ##############################################
     #
     # Take all the above into consideration when creating your controller
@@ -549,16 +592,16 @@ def plot_experiment(exp_name, exp_csvs, rand_csvs, rand_label, final_exp ,out_pn
     k = 1 
     if not  final_exp:
         for r in exp_runs:
-            plt.plot(np.arange(len(r[:L])), r[:L], linewidth=6, alpha=0.35, label = f"Run {exp_name} {k}")
+            plt.plot(np.arange(len(r[:L])), r[:L], linewidth=2, alpha=0.35, label = f"Run {exp_name} {k}")
             k+=1 
     # mean + std
     plt.plot(x, exp_mean, linewidth=2.5, label=f"{exp_name} Mean")
     if not final_exp:
-        plt.fill_between(x, exp_mean-exp_std, exp_mean+exp_std, alpha=0.25, label=f"{exp_name} ± std")
+        plt.fill_between(x, exp_mean-exp_std, exp_mean+exp_std, alpha=0.25, label=f"{exp_name} ± std", color = "pink")
 
     # random baseline overlay
     if rand_mean is not None:
-        plt.plot(x, rand_mean, linestyle="--", linewidth=2, label=rand_label +" Mean")
+        plt.plot(x, rand_mean, linestyle="--", linewidth=2, label=rand_label +" Mean", color = "purple")
     else:
         print(f"[plot] No random runs found")
     plt.xlabel(xlabel); plt.ylabel(ylabel)
@@ -576,7 +619,7 @@ def plot_experiment(exp_name, exp_csvs, rand_csvs, rand_label, final_exp ,out_pn
 
 
 def main(experiment,
-         generations = 60, pop_size=24, T=10.0, seed=[0,1,2],
+         generations = 60, pop_size=24, T=15.0, seed=[0,1,2],
          mlp_hidden=32, mlp_freq_hz=1.0, mlp_alpha=0.25,
          de_F=0.7, de_CR=0.9, de_init_scale=0.5,
          ga_cxpb=0.6, ga_mutpb=0.3, ga_mut_sigma=0.3,    
@@ -669,7 +712,7 @@ def main(experiment,
     if experiment == "mlp_ga":
         best_theta_viz = None
         for i, s in enumerate(seed):
-            out_csv = f"./results/mlp_ga/mlp_ga_seed{s}.csv"
+            out_csv = f"./results/mlp_ga/60gen_mlp_ga_seed{s}.csv"
             theta, best_fit = train_mlp_ga(
                 out_csv=out_csv, generations=generations, pop_size=max(pop_size, 60), T=T, seed=s,
                 model=model, data=data, core_bind=core_bind,
@@ -701,20 +744,20 @@ def main(experiment,
             rand_csvs=rand_csvs,
             rand_label="Random",
             final_exp = False,
-            out_png="./results/plots/exp1_mlp_ga_vs_random.png",
+            out_png="./results/plots/newexp1_mlp_ga_vs_random.png",
             window=plot_window,
             title="Experiment 1: MLP + GA vs Random"
         )
 
         # 2 MLP+DE vs Random
-        exp_csvs = sorted(glob.glob("./results/mlp_de/mlp_de_seed*.csv"))[:3]
+        exp_csvs = sorted(glob.glob("./results/mlp_de/60gen_mlp_de_ seed*.csv"))[:3]
         plot_experiment(
             exp_name="MLP + DE",
             exp_csvs=exp_csvs,
             rand_csvs=rand_csvs,
             rand_label="Random",
             final_exp = False,
-            out_png="./results/plots/exp2_mlp_de_vs_random.png",
+            out_png="./results/plots/newexp2_mlp_de_vs_random.png",
             window=plot_window,
             title="Experiment 2: MLP + DE vs Random"
         )
@@ -765,7 +808,7 @@ def main(experiment,
     # )
 
 if __name__ == "__main__":
-    experiment = "mlp_ga"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
+    experiment = "baseline"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
     main(experiment=experiment)
 
 
