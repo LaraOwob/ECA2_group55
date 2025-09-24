@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 import cma
 from deap import base, creator, tools
 import random as pyrand
+import pandas as pd
+from pathlib import Path
+from scipy.stats import ttest_ind
 
 
 # Local libraries
@@ -26,6 +29,27 @@ TARGET_POS = np.array([0.7, 0.3, 0.1])  # x,y,z
 TOLERANCE = 0.3  # distance to target to be considered "reached"
 
 
+def load_final_best(pattern):
+    """Load final best_fitness values from CSVs matching the pattern."""
+    vals = []
+    for p in sorted(Path().glob(pattern)):
+        df = pd.read_csv(p)
+        if "best_fitness" in df.columns:
+            vals.append(float(df["best_fitness"].iloc[-1]))
+    return vals
+
+def run_ttest():
+    """Run Welch's t-test on final results of DE vs GA."""
+    de = load_final_best("./results/mlp_de/mlp_de_seed*.csv")
+    ga = load_final_best("./results/mlp_ga/mlp_ga_seed*.csv")
+
+    print("Final DE runs:", de)
+    print("Final GA runs:", ga)
+
+    stat, p = ttest_ind(de, ga, equal_var=False)
+    print(f"Welch's t-test: stat={stat:.3f}, p={p:.4f}")
+
+
 #  BASELINE (Random) 
 def run_random_baseline(out_csv, generations=200, pop_size=32, T=10.0, seed=0, model=None, data=None, to_track=None):
     """Evaluate pop_size random rollouts per generation; log best/mean/median to CSV."""
@@ -41,9 +65,6 @@ def run_random_baseline(out_csv, generations=200, pop_size=32, T=10.0, seed=0, m
             writer.writerow([g, best, mean, median])
             if (g + 1) % max(1, generations // 10) == 0:
                 print(f"[baseline seed {seed}] Gen {g+1}/{generations}: best={best:.3f} mean={mean:.3f}")
-
-
-
 
 
 def random_move(model, data, to_track) -> None:
@@ -711,6 +732,9 @@ def main(experiment,
             window=plot_window,
             title="Experiment 3: MLP + GA vs MLP + DE"
         )
+
+        run_ttest()
+
         return
 
 
@@ -741,7 +765,7 @@ def main(experiment,
     # )
 
 if __name__ == "__main__":
-    experiment = "mlp_de"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
+    experiment = "plot"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
     main(experiment=experiment)
 
 
