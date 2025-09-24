@@ -260,7 +260,7 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
         # penalty for movement after reaching
         extra_movement = energy_acc / steps  
         # big bonus for reaching target quickly
-        fitness = 1000.0 + (T - time_to_target) * 100.0 - 50.0 * extra_movement  
+        fitness = 1.0 + (T - time_to_target)/T  -  extra_movement  
 
     else:
         #if target not reached, calculate fitness based on distance to target
