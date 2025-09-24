@@ -6,6 +6,10 @@ import numpy as np
 import mujoco
 from mujoco import viewer
 import matplotlib.pyplot as plt
+import cma
+from deap import base, creator, tools
+import random as pyrand
+
 
 # Local libraries
 from ariel.utils.renderers import video_renderer
@@ -20,46 +24,10 @@ HISTORY = []
 CTRL_RANGE = np.pi / 2
 TARGET_POS = np.array([0.7, 0.3, 0.1])  # x,y,z
 TOLERANCE = 0.3  # distance to target to be considered "reached"
+
+
 #  BASELINE (Random) 
-def rollout_random_headless(model, data, core_bind, T=10.0, rng=None):
-    """One headless episode with step-wise random actions; returns a scalar fitness."""
-    if rng is None:
-        rng = np.random.default_rng()
-    mujoco.set_mjcb_control(None)  # ensure callback isn't used
-    mujoco.mj_resetData(model, data)
-
-    dt = float(model.opt.timestep)
-    steps = int(T / dt)
-    nu = model.nu
-
-    x0 = float(core_bind.xpos[0])
-    energy_acc = 0.0
-    dctrl_acc = 0.0
-    prev = np.zeros(nu, dtype=np.float64)
-
-    for _ in range(steps):
-        ctrl = rng.uniform(-CTRL_RANGE, CTRL_RANGE, size=nu)
-        ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
-        dctrl_acc += float(np.mean(np.abs(ctrl - prev)))
-        energy_acc += float(np.mean(np.abs(ctrl)))
-        prev = ctrl
-
-        data.ctrl[:] = ctrl
-        mujoco.mj_step(model, data)
-        if not np.isfinite(core_bind.xpos[0]):
-            return -1e6  # crash guard
-
-    dx = float(core_bind.xpos[0] - x0)
-    lam_energy = 0.01
-    lam_smooth = 0.01
-    energy = energy_acc / steps
-    smooth = dctrl_acc / steps
-    fitness = dx - lam_energy * energy - lam_smooth * smooth
-    return float(fitness)
-
-
-
-def run_random_baseline(out_csv, generations=200, pop_size=32, T=10.0, seed=0, model=None, data=None, core_bind=None):
+def run_random_baseline(out_csv, generations=200, pop_size=32, T=10.0, seed=0, model=None, data=None, to_track=None):
     """Evaluate pop_size random rollouts per generation; log best/mean/median to CSV."""
     rng = np.random.default_rng(seed)
 
@@ -68,14 +36,12 @@ def run_random_baseline(out_csv, generations=200, pop_size=32, T=10.0, seed=0, m
         writer = csv.writer(f)
         writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
         for g in range(generations):
-            fits = [
-                rollout_random_headless(model, data, core_bind, T=T, rng=rng)
-                for _ in range(pop_size)
-            ]
+            fits = [random_move(model, data, to_track) for _ in range(pop_size)]      
             best, mean, median = float(np.max(fits)), float(np.mean(fits)), float(np.median(fits))
             writer.writerow([g, best, mean, median])
             if (g + 1) % max(1, generations // 10) == 0:
                 print(f"[baseline seed {seed}] Gen {g+1}/{generations}: best={best:.3f} mean={mean:.3f}")
+
 
 
 
@@ -124,7 +90,10 @@ def random_move(model, data, to_track) -> None:
 
     # Save movement to history
     HISTORY.append(to_track[0].xpos.copy())
-
+    
+    final_pos =  to_track[0].xpos.copy()
+    fitness = -np.linalg.norm( final_pos - TARGET_POS)
+    return - float(fitness)
     ##############################################
     #
     # Take all the above into consideration when creating your controller
@@ -165,21 +134,6 @@ def show_qpos_history(history:list):
     plt.show()
 
 
-def random_baseline_callback_factory(seed, to_track):
-    """
-    Returns a MuJoCo control callback that matches the baseline:
-    at each step, set ctrl ~ Uniform[-pi/2, pi/2] independently.
-    """
-    rng = np.random.default_rng(seed)
-    def cb(model, data):
-        nu = model.nu
-        ctrl = rng.uniform(-CTRL_RANGE, CTRL_RANGE, size=nu)
-        data.ctrl[:] = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
-        HISTORY.append(to_track[0].xpos.copy())
-    return cb
-
-
-
 # MLP Controller (shared) for Experiments 1a, 1b, and 3
 class MLPController:
     """
@@ -206,30 +160,31 @@ class MLPController:
         )
 
     def set_params(self, theta: np.ndarray):
+        #Checks length of solution, if it matches the expected number of parameters
         assert theta.shape[0] == self.n_params
+        #Saves copy of solutoin, and saves in object
         self.theta = theta.copy()
 
     def _unpack(self):
+        #Retrieve solution (values)
         t = self.theta
         i = 0
+        #Unpacks solution in W1, b1, W2, b2
         W1 = t[i:i+self.in_dim*self.hidden].reshape(self.in_dim, self.hidden); i += self.in_dim*self.hidden
         b1 = t[i:i+self.hidden]; i += self.hidden
         W2 = t[i:i+self.hidden*self.out_dim].reshape(self.hidden, self.out_dim); i += self.hidden*self.out_dim
         b2 = t[i:i+self.out_dim]
         return W1, b1, W2, b2
-
+    
+    #Applies forward pass and returns MLP output
     def forward(self, prev_ctrl: np.ndarray, t: float, target_pos: np.ndarray, current_pos: np.ndarray) -> np.ndarray:
         w = 2*np.pi*self.freq_hz
-        # relative position to target
-        # inside MLPController.forward
-        delta = target_pos[:2] - current_pos[:2]  # x,y only
-        dist_to_target = np.linalg.norm(delta)
-        if dist_to_target < TOLERANCE:  # threshold to "stop"
-            print("Reached target!")
+        #includes the distance to target as input
+        delta = target_pos[:2] - current_pos[:2] 
         obs = np.concatenate([prev_ctrl, [np.sin(w*t), np.cos(w*t)], delta], dtype=np.float64)
         W1, b1, W2, b2 = self._unpack()
         h = np.tanh(obs @ W1 + b1)
-        y = np.tanh(h @ W2 + b2)  # in [-1,1]
+        y = np.tanh(h @ W2 + b2)
         return CTRL_RANGE * y
 
 def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq_hz=1.0, alpha=0.2):
@@ -238,6 +193,7 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     Returns loss = -fitness (so optimizers can minimize).
     alpha: smoothing factor for actions (0=no smoothing, 1=full new action).
     """
+    #creates mujoco data for evaluation
     mujoco.set_mjcb_control(None)
     data_eval = mujoco.MjData(model)
     mujoco.mj_resetData(model, data_eval)
@@ -251,12 +207,13 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
     prev = np.zeros(nu, dtype=np.float64)
     start_pos = data_eval.xpos[core_bind.id].copy()
     initial_dist = np.linalg.norm(start_pos - TARGET_POS)
-    
+    #starting values for fitness calculation
     energy_acc = 0.0
     dctrl_acc = 0.0
     progress_reward = 0.0
     reached =False
     time_to_target = None
+    
     for k in range(steps):
         t = k * dt
         current_pos = data_eval.xpos[core_bind.id]
@@ -266,7 +223,6 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
         
         dctrl_acc += float(np.mean(np.abs(ctrl - prev)))
         energy_acc += float(np.mean(np.abs(ctrl)))
-        
         
         prev = ctrl
         data_eval.ctrl[:] = ctrl
@@ -281,12 +237,12 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
             return 1e6  # big loss on crash
     if reached:
         # penalty for movement after reaching
-        extra_movement = energy_acc / steps  # or np.mean(np.abs(ctrl)) after reaching
-        fitness = 1000.0 + (T - time_to_target) * 100.0 - 50.0 * extra_movement  # big bonus for reaching target quickly
-        print(f"Reached target in {time_to_target:.2f}s, fitness {fitness:.2f}")
+        extra_movement = energy_acc / steps  
+        # big bonus for reaching target quickly
+        fitness = 1000.0 + (T - time_to_target) * 100.0 - 50.0 * extra_movement  
 
     else:
-        # final position
+        #if target not reached, calculate fitness based on distance to target
         current_pos = data_eval.xpos[core_bind.id]
         final_dist = np.linalg.norm(current_pos - TARGET_POS)
         progress_reward = (initial_dist - final_dist)/steps
@@ -296,116 +252,77 @@ def evaluate_mlp_headless(theta, model, data, core_bind, T=10.0, hidden=32, freq
         energy = energy_acc / steps
         smooth = dctrl_acc / steps
         fitness = dx - lam_energy * energy - lam_smooth * smooth - progress_reward*lam_smooth
-    return -float(fitness)  # minimize loss
+    return -float(fitness)  
+
+
+
 
 def mlp_viewer_callback_factory(theta, to_track, hidden=32, freq_hz=1.0, alpha=0.2, dt=0.01):
     """Viewer callback to run the trained MLP policy."""
-    step_k = {'k': 0}
-    ctrlr_cache = {'ctrlr': None}
-    prev = np.zeros(1, dtype=np.float64)  # resized on first call
+    #Initialize step, prev_controller and current controller
+    step = 0
+    prev_controller = None
+    controller = None
 
-    def cb(model, data):
-        nonlocal prev
-        if ctrlr_cache['ctrlr'] is None:
+    def callback(model, data):
+        nonlocal step, prev_controller, controller
+
+        if controller is None:
+            # Initialize controller on first call
             nu = model.nu
-            ctrlr_cache['ctrlr'] = MLPController(nu, hidden=hidden, freq_hz=freq_hz)
-            ctrlr_cache['ctrlr'].set_params(theta)
-            prev = np.zeros(nu, dtype=np.float64)
-        k = step_k['k']; t = k * dt
-        current_pos = to_track[0].xpos.copy()  # shape (3,) for x,y,z
+            controller = MLPController(nu, hidden=hidden, freq_hz=freq_hz)
+            #Set parameters of solution (weigths)
+            controller.set_params(theta)
+            prev_controller = np.zeros(nu, dtype=np.float64)
 
-        raw = ctrlr_cache['ctrlr'].forward(prev, t,TARGET_POS,current_pos)
-        ctrl = (1 - alpha) * prev + alpha * raw
+        t = step * dt
+        current_pos = to_track[0].xpos.copy() 
+        #Calcualte mlp output
+        raw_ctrl = controller.forward(prev_controller, t,TARGET_POS,current_pos)
+        #Smoothing movement
+        ctrl = (1 - alpha) * prev_controller + alpha * raw_ctrl
+        #Set range of movement between interval
         ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
+
+        #Update data
         data.ctrl[:] = ctrl
         final_dist = np.linalg.norm(current_pos - TARGET_POS)
-        print(f"Step {k}, pos {current_pos}, dist to target {final_dist:.3f}")
-        HISTORY.append(to_track[0].xpos.copy())
-        prev[:] = ctrl
-        step_k['k'] = k + 1
-    return cb
+        print(f"Step {t}, pos {current_pos}, dist to target {final_dist:.3f}")
+        #Add new step to history
+        HISTORY.append(current_pos)
+        #Set previous_controller to current controller
+        prev_controller[:] = ctrl
+        #Increase step
+        step += 1
 
-
-# CMA-ES on MLP (1a) 
-
-def train_mlp_cma(out_csv, generations=100, pop_size=None, T=10.0, seed=0, model=None, data=None, core_bind=None,
-                  hidden=32, freq_hz=1.0, sigma0=0.5, alpha=0.2):
-    """CMA-ES optimization of MLP weights. Logs per-generation best/mean/median fitness. Returns (best_theta, best_fitness)."""
-    try:
-        import cma
-    except ImportError as e:
-        raise RuntimeError("CMA-ES requires the 'cma' package. `pip install cma`.") from e
-
-    nu = model.nu
-    ctrlr = MLPController(nu, hidden=hidden, freq_hz=freq_hz)
-    n_params = ctrlr.n_params
-    if pop_size is None:
-        pop_size = int(4 + np.floor(3 * np.log(n_params)))
-    print("the pop size is", pop_size)
-    x0 = np.zeros(n_params, dtype=np.float64)
-    es = cma.CMAEvolutionStrategy(x0, sigma0, {'popsize': pop_size, 'seed': seed})
-
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    best_theta = None
-    best_fit = -np.inf
-
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
-        g = 0
-        while not es.stop() and g < generations:
-            thetas = es.ask()
-            losses = []
-            fits = []
-            for th in thetas:
-                loss = evaluate_mlp_headless(
-                    np.asarray(th, dtype=np.float64),
-                    model, data, core_bind,
-                    T=T, hidden=hidden, freq_hz=freq_hz, alpha=alpha
-                )
-                losses.append(loss)
-                fits.append(-loss)
-            es.tell(thetas, losses)
-            gen_best = float(np.max(fits))
-            gen_mean = float(np.mean(fits))
-            gen_median = float(np.median(fits))
-            writer.writerow([g, gen_best, gen_mean, gen_median])
-            if gen_best > best_fit:
-                best_fit = gen_best
-                best_theta = np.asarray(thetas[int(np.argmax(fits))], dtype=np.float64)
-            if (g + 1) % max(1, generations // 10) == 0:
-                print(f"[mlp_cma seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
-            g += 1
-
-    return best_theta, best_fit
-
-
+    return callback
 
 #  Differential Evolution on MLP (1b)
-
 def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=None, data=None, core_bind=None,
                  hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, alpha=0.2):
     """
-    Simple, dependency-free Differential Evolution (DE/rand/1/bin) for MLP params.
-    Maximizes fitness (like our logs). Returns (best_theta, best_fitness).
+    Simple, Differential Evolution for MLP parameters.
     """
+    #Selects random number 
     rng = np.random.default_rng(seed)
     nu = model.nu
-    ctrlr = MLPController(nu, hidden=hidden, freq_hz=freq_hz)
-    n = ctrlr.n_params
+    number_params = MLPController(nu, hidden=hidden, freq_hz=freq_hz).n_params
+    # number_params = ctrlr.n_params
 
-    # Initialize population around 0 with scale
-    pop = rng.normal(loc=0.0, scale=init_scale, size=(pop_size, n))
+    # Initialize population by sampling normal distribution with mean 0 and stdv of init_scale
+    pop = rng.normal(loc=0.0, scale=init_scale, size=(pop_size, number_params))
+    #Initialize empty numby array with length number of candidates
     fits = np.empty(pop_size, dtype=np.float64)
 
-    # Evaluate initial population
+    # Calculate fitness for each candidate, pop[i] = candidate
     for i in range(pop_size):
         loss = evaluate_mlp_headless(pop[i], model, data, core_bind, T=T, hidden=hidden, freq_hz=freq_hz, alpha=alpha)
         fits[i] = -loss  # fitness
 
+    #Finds best fitnesses
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     best_idx = int(np.argmax(fits))
-    best_theta = pop[best_idx].copy()
+    best_candidate = pop[best_idx].copy()
     best_fit = float(fits[best_idx])
 
     with open(out_csv, "w", newline="") as f:
@@ -413,207 +330,65 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
         writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
         for g in range(generations):
             for i in range(pop_size):
-                # Mutation: select a,b,c distinct from i
-                idxs = list(range(pop_size))
-                idxs.remove(i)
-                a, b, c = rng.choice(idxs, size=3, replace=False)
+                #Select all indices expcept for i, the candidate you want to mutate
+                choices = []
+                for index in range(pop_size):
+                    if index != i:
+                        choices.append(index)
+                #Out of valid choices, choose 3 random candidates 
+                a, b, c = rng.choice(choices, size=3, replace=False)
+                #Mutant candidate:
                 mutant = pop[a] + F * (pop[b] - pop[c])
 
-                # Crossover (binomial)
-                cross = rng.random(n) < CR
-                jrand = rng.integers(0, n)
-                cross[jrand] = True
+                # Crossover (binomial), between parent and mutant
+                #Creates list of length weights whether each gene will be changed or stays like parent. Returns FAlse or True list
+                cross = rng.random(number_params) < CR
+                #At least one random gene will be open for crossover with mutant
+                cross[rng.integers(0, number_params)] = True 
+                #The genes which were chosen by cross validation proability are adjusted
                 trial = np.where(cross, mutant, pop[i])
 
                 # Evaluate trial
                 loss = evaluate_mlp_headless(trial, model, data, core_bind, T=T, hidden=hidden, freq_hz=freq_hz, alpha=alpha)
                 f_trial = -loss
 
-                # Selection
+                # If trial is better than parent than trial enters population
                 if f_trial >= fits[i]:
                     pop[i] = trial
                     fits[i] = f_trial
 
-            # Log stats
+            # Retrieve stats: best fitness, mean fitness and median fitness and write to csv
             gen_best = float(np.max(fits))
             gen_mean = float(np.mean(fits))
             gen_median = float(np.median(fits))
             writer.writerow([g, gen_best, gen_mean, gen_median])
 
-            # Track global best
+            # Update and check best candidate with best fitness
             if gen_best > best_fit:
                 best_fit = gen_best
-                best_theta = pop[int(np.argmax(fits))].copy()
+                best_candidate = pop[int(np.argmax(fits))].copy()
 
+            #Print every after every 10th generation
             if (g + 1) % max(1, generations // 10) == 0:
                 print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
 
-    return best_theta, best_fit
-
-
-
-# CPG Controller (Exp 2)
-
-class CPGController:
-    """
-    Open-loop per-joint oscillator:
-      ctrl_j(t) = b_j + A_j * sin(2π f_j t + phi_j)
-    Genome per joint: [A, f, phi, b]
-    """
-    def __init__(self, nu: int, A_max=CTRL_RANGE, f_min=0.1, f_max=2.0, b_max=CTRL_RANGE):
-        self.nu = nu
-        self.A_max = A_max
-        self.f_min = f_min
-        self.f_max = f_max
-        self.b_max = b_max
-        self.params = None  # shape (nu, 4)
-
-    @property
-    def n_params(self):
-        return self.nu * 4
-
-    def set_params(self, theta: np.ndarray):
-        assert theta.shape[0] == self.n_params
-        self.params = theta.reshape(self.nu, 4).copy()
-
-    def forward(self, t: float) -> np.ndarray:
-        A = np.clip(self.params[:, 0], 0.0, self.A_max)
-        f = np.clip(self.params[:, 1], self.f_min, self.f_max)
-        phi = self.params[:, 2]
-        b = np.clip(self.params[:, 3], -self.b_max, self.b_max)
-        ctrl = b + A * np.sin(2*np.pi*f*t + phi)
-        return np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
-
-def evaluate_cpg_headless(theta, model, data, core_bind, T=10.0, A_max=CTRL_RANGE, f_min=0.1, f_max=2.0, b_max=CTRL_RANGE, alpha=0.2):
-    """Headless rollout for a CPG controller. Returns loss = -fitness."""
-    mujoco.set_mjcb_control(None)
-    mujoco.mj_resetData(model, data)
-
-    dt = float(model.opt.timestep)
-    steps = int(T / dt)
-    nu = model.nu
-
-    ctrlr = CPGController(nu, A_max=A_max, f_min=f_min, f_max=f_max, b_max=b_max)
-    ctrlr.set_params(theta)
-    prev = np.zeros(nu, dtype=np.float64)
-
-    x0 = float(core_bind.xpos[0])
-    energy_acc = 0.0
-    dctrl_acc = 0.0
-
-    for k in range(steps):
-        t = k * dt
-        raw = ctrlr.forward(t)
-        ctrl = (1 - alpha) * prev + alpha * raw
-        ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
-        dctrl_acc += float(np.mean(np.abs(ctrl - prev)))
-        energy_acc += float(np.mean(np.abs(ctrl)))
-        prev = ctrl
-        data.ctrl[:] = ctrl
-        mujoco.mj_step(model, data)
-        if not np.isfinite(core_bind.xpos[0]):
-            return 1e6
-
-    dx = float(core_bind.xpos[0] - x0)
-    lam_energy = 0.01
-    lam_smooth = 0.01
-    energy = energy_acc / steps
-    smooth = dctrl_acc / steps
-    fitness = dx - lam_energy * energy - lam_smooth * smooth
-    return -float(fitness)
-
-def cpg_viewer_callback_factory(theta, to_track, dt=0.01, A_max=CTRL_RANGE, f_min=0.1, f_max=2.0, b_max=CTRL_RANGE, alpha=0.2):
-    """Viewer callback for a trained CPG."""
-    step_k = {'k': 0}
-    ctrlr_cache = {'ctrlr': None}
-    prev = np.zeros(1, dtype=np.float64)
-    def cb(model, data):
-        nonlocal prev
-        if ctrlr_cache['ctrlr'] is None:
-            nu = model.nu
-            ctrlr_cache['ctrlr'] = CPGController(nu, A_max=A_max, f_min=f_min, f_max=f_max, b_max=b_max)
-            ctrlr_cache['ctrlr'].set_params(theta)
-            prev = np.zeros(nu, dtype=np.float64)
-        k = step_k['k']; t = k * dt
-        raw = ctrlr_cache['ctrlr'].forward(t)
-        ctrl = (1 - alpha) * prev + alpha * raw
-        ctrl = np.clip(ctrl, -CTRL_RANGE, CTRL_RANGE)
-        data.ctrl[:] = ctrl
-        HISTORY.append(to_track[0].xpos.copy())
-        prev[:] = ctrl
-        step_k['k'] = k + 1
-    return cb
-
-def train_cpg_cma(out_csv, generations=100, pop_size=None, T=10.0, seed=0, model=None, data=None, core_bind=None,
-                  A_max=CTRL_RANGE, f_min=0.1, f_max=2.0, b_max=CTRL_RANGE, sigma0=0.5, alpha=0.2):
-    """CMA-ES optimization of CPG params. Returns (best_theta, best_fitness)."""
-    try:
-        import cma
-    except ImportError as e:
-        raise RuntimeError("CMA-ES requires the 'cma' package. `pip install cma`.") from e
-
-    nu = model.nu
-    n_params = nu * 4
-    if pop_size is None:
-        pop_size = int(4 + np.floor(3 * np.log(n_params)))
-
-    x0 = np.zeros(n_params, dtype=np.float64)
-    es = cma.CMAEvolutionStrategy(x0, sigma0, {'popsize': pop_size, 'seed': seed})
-
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    best_theta = None
-    best_fit = -np.inf
-
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
-        g = 0
-        while not es.stop() and g < generations:
-            thetas = es.ask()
-            losses, fits = [], []
-            for th in thetas:
-                loss = evaluate_cpg_headless(
-                    np.asarray(th, dtype=np.float64),
-                    model, data, core_bind,
-                    T=T, A_max=A_max, f_min=f_min, f_max=f_max, b_max=b_max, alpha=alpha
-                )
-                losses.append(loss)
-                fits.append(-loss)
-            es.tell(thetas, losses)
-            gen_best = float(np.max(fits))
-            gen_mean = float(np.mean(fits))
-            gen_median = float(np.median(fits))
-            writer.writerow([g, gen_best, gen_mean, gen_median])
-            if gen_best > best_fit:
-                best_fit = gen_best
-                best_theta = np.asarray(thetas[int(np.argmax(fits))], dtype=np.float64)
-            if (g + 1) % max(1, generations // 10) == 0:
-                print(f"[cpg_cma seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
-            g += 1
-
-    return best_theta, best_fit
-
+    return best_candidate, best_fit
 
 #  Experiment 3: MLP + GA
-
-def train_mlp_ga(out_csv, generations=200, pop_size=60, T=10.0, seed=0, model=None, data=None, core_bind=None,
-                 hidden=32, freq_hz=1.0, cxpb=0.6, mutpb=0.3, mut_sigma=0.3, alpha=0.2):
+def train_mlp_ga(out_csv, generations=100, pop_size=60, T=10.0, seed=0, model=None, data=None, core_bind=None,
+                 hidden=32, freq_hz=1.0, crossover_prob=0.6, mutation_prob=0.3, mut_sigma=0.3, alpha=0.2):
     """
     Genetic Algorithm on MLP parameters using DEAP (recognized EA library).
     Maximizes fitness. Returns (best_theta, best_fitness).
     """
-    try:
-        from deap import base, creator, tools
-    except ImportError as e:
-        raise RuntimeError("DEAP is required for GA. Install with `pip install deap`.") from e
-
-    import random as pyrand
+   
     np.random.seed(seed)
     pyrand.seed(seed)
 
     nu = model.nu
+
     n_params = MLPController(nu, hidden=hidden, freq_hz=freq_hz).n_params
-    print("this is the mlp ga with generations ", generations)
+
     # Safe creator (avoid duplicate class creation on re-runs)
     try:
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -625,75 +400,90 @@ def train_mlp_ga(out_csv, generations=200, pop_size=60, T=10.0, seed=0, model=No
         pass
 
     toolbox = base.Toolbox()
-    # init around 0.0 (like CMA-ES mean)
+    #Registers function attr_float, which will return a sample from Normal distribution with mean 0 and stdv 0.5
     toolbox.register("attr_float", pyrand.gauss, 0.0, 0.5)
+    #Registers function individual(), which will create a list of length n_params, and values the parameters of the MLP
     toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, n=n_params)
+    #Registers function population(),  which will return list of the population, each candidate with its values and fitness
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
+    #Evaluate a candidate
     def eval_ind(individual):
         theta = np.asarray(individual, dtype=np.float64)
         loss = evaluate_mlp_headless(theta, model, data, core_bind, T=T, hidden=hidden, freq_hz=freq_hz, alpha=alpha)
-        return (-loss,)  # DEAP expects a tuple
-
+        #Casted to tuple, because DEAP needs it to be a tuple
+        return (-loss,) 
+    #Register the evaluation function
     toolbox.register("evaluate", eval_ind)
-    toolbox.register("mate", tools.cxBlend, alpha=0.5)  # BLX-α crossover for reals
+    #Registers the cross over function: BLX-alpha crossover
+    toolbox.register("mate", tools.cxBlend, alpha=0.5) 
+    #Registers the mutation function: adds gaussian noise to genes, mean 0 and stdv mut_sigma, and mutation probability 1/number params
     toolbox.register("mutate", tools.mutGaussian, mu=0.0, sigma=mut_sigma, indpb=1.0/n_params)
+    #Registers selection procedure: Tornament: selects best out of 3 candidates
     toolbox.register("select", tools.selTournament, tournsize=3)
 
-    pop = toolbox.population(n=pop_size)
+    #Registers and initializes the population to be of size pop_size
+    population = toolbox.population(n=pop_size)
 
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     with open(out_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
 
-        # Evaluate initial
-        for ind in pop:
-            ind.fitness.values = toolbox.evaluate(ind)
+        # Evaluate each inidivual candidate
+        for individual in population:
+            individual.fitness.values = toolbox.evaluate(individual)
 
         for g in range(generations):
-            # Selection & variation
-            offspring = toolbox.select(pop, len(pop))
+            # Selection poule for cross_over and mutation
+            offspring = toolbox.select(population, len(population))
+            # Parent is cloned to be offspring, to make sure parents still exists
             offspring = list(map(toolbox.clone, offspring))
 
             # Crossover
+            #Step size of 2 because we select 2 parents
             for i in range(0, len(offspring)-1, 2):
-                if pyrand.random() < cxpb:
+                #Draw random number to check with cross over probability
+                if pyrand.random() < crossover_prob:
+                    #Apply cross_over
                     toolbox.mate(offspring[i], offspring[i+1])
+                    #Delete old fitness values of offsprings
                     del offspring[i].fitness.values
                     del offspring[i+1].fitness.values
 
             # Mutation
-            for ind in offspring:
-                if pyrand.random() < mutpb:
-                    toolbox.mutate(ind)
-                    del ind.fitness.values
+            for individual in offspring:
+                #Draw random number to check with mutation probability
+                if pyrand.random() < mutation_prob:
+                    #Apply mutation
+                    toolbox.mutate(individual)
+                    #Delete old fitness of offspring
+                    del individual.fitness.values
 
-            # Evaluate invalid
+            #The fitness of the new offsprings still need to be updated
             invalid = [ind for ind in offspring if not ind.fitness.valid]
-            for ind in invalid:
-                ind.fitness.values = toolbox.evaluate(ind)
+            for individual in invalid:
+                individual.fitness.values = toolbox.evaluate(individual)
 
             # Survivor replacement
-            pop = offspring
+            population = offspring
 
             # Logging
-            fits = np.array([ind.fitness.values[0] for ind in pop], dtype=np.float64)
+            fits = np.array([ind.fitness.values[0] for ind in population], dtype=np.float64)
             writer.writerow([g, float(np.max(fits)), float(np.mean(fits)), float(np.median(fits))])
 
             if (g + 1) % max(1, generations // 10) == 0:
                 print(f"[mlp_ga seed {seed}] Gen {g+1}/{generations}: best={np.max(fits):.3f} mean={np.mean(fits):.3f}")
 
     # Champion
-    from deap import tools as deap_tools
-    best_ind = deap_tools.selBest(pop, 1)[0]
+    
+    best_ind = tools.selBest(population, 1)[0]
     best_theta = np.asarray(best_ind, dtype=np.float64)
     best_fit = float(best_ind.fitness.values[0])
     return best_theta, best_fit
 
 
 # PLOTTING 
-
 def moving_avg(x, w=10):
     if w <= 1:
         return x
@@ -708,7 +498,7 @@ def load_series(csv_path):
     df = pd.read_csv(csv_path)
     return df["best_fitness"].to_numpy()
 
-def plot_experiment(exp_name, exp_csvs, rand_csvs, out_png, window=10, title=None, xlabel="Generation", ylabel="Fitness"):
+def plot_experiment(exp_name, exp_csvs, rand_csvs, rand_label, final_exp ,out_png, window=10, title=None, xlabel="Generation", ylabel="Fitness"):
     # Load runs
     exp_runs = [load_series(p) for p in exp_csvs]
     if len(exp_runs) == 0:
@@ -716,37 +506,40 @@ def plot_experiment(exp_name, exp_csvs, rand_csvs, out_png, window=10, title=Non
         return
     L = min(len(r) for r in exp_runs)
     exp_runs = [r[:L] for r in exp_runs]
-    exp_sm = [moving_avg(r, window) for r in exp_runs]
-    exp_mean = np.mean(exp_sm, axis=0)
-    exp_std  = np.std(exp_sm, axis=0)
+    exp_mean = np.mean(exp_runs, axis=0)
+    exp_std  = np.std(exp_runs, axis=0)
+
+    
 
     rand_runs = [load_series(p) for p in rand_csvs]
     if len(rand_runs) > 0:
         Lr = min(len(r) for r in rand_runs)
         L = min(L, Lr)
-        exp_sm = [r[:L] for r in exp_sm]
         exp_mean, exp_std = exp_mean[:L], exp_std[:L]
         rand_runs = [r[:L] for r in rand_runs]
-        rand_sm = [moving_avg(r, window) for r in rand_runs]
-        rand_mean = np.mean(rand_sm, axis=0)
-        rand_std  = np.std(rand_sm, axis=0)
+        rand_mean = np.mean(rand_runs, axis=0)
+        
     else:
         rand_mean = None
 
     x = np.arange(len(exp_mean))
     plt.figure(figsize=(8,4.5))
     # individual runs (light)
-    for r in exp_runs:
-        plt.plot(np.arange(len(r[:L])), r[:L], linewidth=1, alpha=0.35)
+    k = 1 
+    if not  final_exp:
+        for r in exp_runs:
+            plt.plot(np.arange(len(r[:L])), r[:L], linewidth=6, alpha=0.35, label = f"Run {exp_name} {k}")
+            k+=1 
     # mean + std
-    plt.plot(x, exp_mean, linewidth=2.5, label=f"{exp_name} (mean MA)")
-    plt.fill_between(x, exp_mean-exp_std, exp_mean+exp_std, alpha=0.25, label=f"{exp_name} ± std")
+    plt.plot(x, exp_mean, linewidth=2.5, label=f"{exp_name} Mean")
+    if not final_exp:
+        plt.fill_between(x, exp_mean-exp_std, exp_mean+exp_std, alpha=0.25, label=f"{exp_name} ± std")
 
     # random baseline overlay
     if rand_mean is not None:
-        plt.plot(x, rand_mean, linestyle="--", linewidth=2, label="Random (mean MA)")
-        plt.fill_between(x, rand_mean-rand_std, rand_mean+rand_std, alpha=0.15, label="Random ± std")
-
+        plt.plot(x, rand_mean, linestyle="--", linewidth=2, label=rand_label +" Mean")
+    else:
+        print(f"[plot] No random runs found")
     plt.xlabel(xlabel); plt.ylabel(ylabel)
     if title is None:
         title = f"{exp_name} vs Random"
@@ -762,24 +555,16 @@ def plot_experiment(exp_name, exp_csvs, rand_csvs, out_png, window=10, title=Non
 
 
 def main(experiment,
-         generations=200, pop_size=24, T=10.0, seed=[0,1,2],
-         # MLP hyperparams
-         mlp_hidden=32, cma_sigma0=0.7, mlp_freq_hz=1.0, mlp_alpha=0.25,
-         # DE hyperparams
+         generations = 5, pop_size=24, T=10.0, seed=[0,1,2],
+         mlp_hidden=32, mlp_freq_hz=1.0, mlp_alpha=0.25,
          de_F=0.7, de_CR=0.9, de_init_scale=0.5,
-         # GA (DEAP) hyperparams
-         ga_cxpb=0.6, ga_mutpb=0.3, ga_mut_sigma=0.3,
-         # CPG hyperparams
-         cpg_A_max=CTRL_RANGE, cpg_f_min=0.1, cpg_f_max=2.0, cpg_b_max=CTRL_RANGE, cpg_sigma0=0.5, cpg_alpha=0.2,
-         # plotting
+         ga_cxpb=0.6, ga_mutpb=0.3, ga_mut_sigma=0.3,    
          plot_window=10):
     """Main function to run the simulation with random movements.
         Experiments:
-      - "baseline": random baseline CSVs + viewer of baseline
-      - "mlp_cma":  MLP + CMA-ES (Exp 1a) CSVs + viewer of champion
-      - "mlp_de":   MLP + Differential Evolution (Exp 1b) CSVs + viewer of champion
-      - "cpg_cma":  CPG + CMA-ES (Exp 2) CSVs + viewer of champion
-            - "mlp_ga":   MLP + Genetic Algorithm (DEAP) (Exp 3)
+      - "baseline": random moves CSVs + viewer of baseline
+      - "mlp_de":   MLP + Differential Evolution CSVs + viewer of champion
+        - "mlp_ga":   MLP + Genetic Algorithm (DEAP) 
       - "plot":     Generate 3 plots (1a, 1b, 2) overlaying Random baseline"""
     # Initialise controller to controller to None, always in the beginning.
     mujoco.set_mjcb_control(None) # DO NOT REMOVE
@@ -795,15 +580,16 @@ def main(experiment,
     # Spawn robot in the world
     # Check docstring for spawn conditions
     world.spawn(gecko_core.spec, spawn_position=[0, 0, 0])
+    # Add target marker
     world.spec.worldbody.add_geom(
     type=mujoco.mjtGeom.mjGEOM_SPHERE,
     name="target_marker",
-    size=[0.05, 0.0, 0.0],          # radius of sphere
-    pos=TARGET_POS, # your TARGET_POS
-    rgba=[1, 0, 0, 1],    # red, opaque
-    contype=0,            # no collisions
-    conaffinity=0
-    )
+    size=[0.05, 0.0, 0.0],          
+    pos=TARGET_POS, 
+    rgba=[1, 0, 0, 1],  
+    contype=0,            
+    conaffinity=0)
+    
     # Generate the model and data
     # These are standard parts of the simulation USE THEM AS IS, DO NOT CHANGE
     model = world.spec.compile()
@@ -817,44 +603,26 @@ def main(experiment,
 
     core_bind = to_track[0]
     dt = float(model.opt.timestep)
-    print("in main and we have generations", generations)
+
     # Run random baseline experiment
     if experiment == "baseline":
         for s in seed:
-            out_csv = f"./results/baseline/baseline_seed{s}.csv"
+            out_csv = f"./results/random/random_seed{s}.csv"
             run_random_baseline(out_csv, generations=generations, pop_size=pop_size, T=T, seed=s,
-                                model=model, data=data, core_bind=core_bind)
+                                model=model, data=data, to_track=to_track)
             
          # 2) (Optional) visualize one baseline rollout in the viewer
         #    Use the SAME distribution as in the headless baseline.
         mujoco.mj_resetData(model, data)         # start fresh
-        cb = random_baseline_callback_factory(seed[0], to_track)
-        mujoco.set_mjcb_control(cb)
+
+        # Set the control callback function
+        # This is called every time step to get the next action. 
+        mujoco.set_mjcb_control(lambda m,d: random_move(m, d, to_track))
         viewer.launch(model=model, data=data)
         show_qpos_history(HISTORY)
         return  # don't also run the demo callback
     
-    # MLP + CMA-ES (1a) 
-    if experiment == "mlp_cma":
-        best_theta_viz = None
-        for i, s in enumerate(seed):
-            out_csv = f"./results/mlp_cma/mlp_cma_seed{s}.csv"
-            theta, best_fit = train_mlp_cma(
-                out_csv=out_csv, generations=generations, pop_size=pop_size, T=T, seed=s,
-                model=model, data=data, core_bind=core_bind,
-                hidden=mlp_hidden, freq_hz=mlp_freq_hz, sigma0=cma_sigma0, alpha=mlp_alpha
-            )
-            print(f"[mlp_cma seed {s}] best_fitness={best_fit:.3f}")
-            if i == 0: best_theta_viz = theta
-        if best_theta_viz is not None:
-            mujoco.mj_resetData(model, data)
-            cb = mlp_viewer_callback_factory(best_theta_viz, to_track, hidden=mlp_hidden, freq_hz=mlp_freq_hz, alpha=mlp_alpha, dt=dt)
-            mujoco.set_mjcb_control(cb)
-            viewer.launch(model=model, data=data)
-            show_qpos_history(HISTORY)
-        return
-
-    # MLP + DE (1b)
+    # MLP + DE
     if experiment == "mlp_de":
         best_theta_viz = None
         for i, s in enumerate(seed):
@@ -874,29 +642,9 @@ def main(experiment,
             show_qpos_history(HISTORY)
         return
 
-    #  CPG + CMA-ES (2)
-    if experiment == "cpg_cma":
-        best_theta_viz = None
-        for i, s in enumerate(seed):
-            out_csv = f"./results/cpg_cma/cpg_cma_seed{s}.csv"
-            theta, best_fit = train_cpg_cma(
-                out_csv=out_csv, generations=generations, pop_size=pop_size, T=T, seed=s,
-                model=model, data=data, core_bind=core_bind,
-                A_max=cpg_A_max, f_min=cpg_f_min, f_max=cpg_f_max, b_max=cpg_b_max, sigma0=cpg_sigma0, alpha=cpg_alpha
-            )
-            print(f"[cpg_cma seed {s}] best_fitness={best_fit:.3f}")
-            if i == 0: best_theta_viz = theta
-        if best_theta_viz is not None:
-            mujoco.mj_resetData(model, data)
-            cb = cpg_viewer_callback_factory(best_theta_viz, to_track, dt=dt, A_max=cpg_A_max, f_min=cpg_f_min, f_max=cpg_f_max, b_max=cpg_b_max, alpha=cpg_alpha)
-            mujoco.set_mjcb_control(cb)
-            viewer.launch(model=model, data=data)
-            
-        show_qpos_history(HISTORY)
-        return
     
 
-    #  MLP + GA (DEAP) (3)
+    #  MLP + GA (DEAP)
     if experiment == "mlp_ga":
         best_theta_viz = None
         for i, s in enumerate(seed):
@@ -924,37 +672,44 @@ def main(experiment,
         # Random baseline CSVs (3 runs)
         rand_csvs = sorted(glob.glob("./results/random/random_seed*.csv"))[:3]
 
-        # 1a MLP+CMA vs Random
-        exp_csvs = sorted(glob.glob("./results/mlp_cma/mlp_cma_seed*.csv"))[:3]
+        # 1 MLP+CMA vs Random
+        exp_csvs = sorted(glob.glob("./results/mlp_ga/mlp_ga_seed*.csv"))[:3]
         plot_experiment(
-            exp_name="MLP + CMA-ES",
+            exp_name="MLP + GA",
             exp_csvs=exp_csvs,
             rand_csvs=rand_csvs,
-            out_png="./results/plots/exp1a_mlp_cma_vs_random.png",
+            rand_label="Random",
+            final_exp = False,
+            out_png="./results/plots/exp1_mlp_ga_vs_random.png",
             window=plot_window,
-            title="Experiment 1a: MLP + CMA-ES vs Random"
+            title="Experiment 1: MLP + GA vs Random"
         )
 
-        # 1b MLP+DE vs Random
+        # 2 MLP+DE vs Random
         exp_csvs = sorted(glob.glob("./results/mlp_de/mlp_de_seed*.csv"))[:3]
         plot_experiment(
             exp_name="MLP + DE",
             exp_csvs=exp_csvs,
             rand_csvs=rand_csvs,
-            out_png="./results/plots/exp1b_mlp_de_vs_random.png",
+            rand_label="Random",
+            final_exp = False,
+            out_png="./results/plots/exp2_mlp_de_vs_random.png",
             window=plot_window,
-            title="Experiment 1b: MLP + DE vs Random"
+            title="Experiment 2: MLP + DE vs Random"
         )
 
-        # 2 CPG+CMA vs Random
-        exp_csvs = sorted(glob.glob("./results/cpg_cma/cpg_cma_seed*.csv"))[:3]
+        # 2 MLP + GA vs MLP + DE
+        exp_csvs1 = sorted(glob.glob("./results/mlp_ga/mlp_ga_seed*.csv"))[:3]
+        exp_csvs2= sorted(glob.glob("./results/mlp_de/mlp_de_seed*.csv"))[:3]
         plot_experiment(
-            exp_name="CPG + CMA-ES",
-            exp_csvs=exp_csvs,
-            rand_csvs=rand_csvs,
-            out_png="./results/plots/exp2_cpg_cma_vs_random.png",
+            exp_name="MLP + GA",
+            exp_csvs=exp_csvs1,
+            rand_csvs=exp_csvs2,
+            rand_label="MLP + DE",
+            final_exp = True,
+            out_png="./results/plots/exp3_mlp_ga_vs_mlp_de.png",
             window=plot_window,
-            title="Experiment 2: CPG + CMA-ES vs Random"
+            title="Experiment 3: MLP + GA vs MLP + DE"
         )
         return
 
@@ -986,7 +741,7 @@ def main(experiment,
     # )
 
 if __name__ == "__main__":
-    experiment = "mlp_ga"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
+    experiment = "plot"  # "baseline" or "mlp_cma" or "mlp_de" or "cpg_cma" or "mlp_ga" or "plot"
     main(experiment=experiment)
 
 
