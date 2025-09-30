@@ -45,6 +45,105 @@ DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(exist_ok=True)
 
 
+
+
+
+def makeNeuralNetwork(input_size: int, output_size: int):
+    
+    """
+    create a net that takes in the positions of the joints and outputs
+    new positions for the joints
+    with the hidden layers etc predefined
+  
+    
+    """
+    return 0    
+
+
+def makeBody():
+    """
+    create a body using the nde and hpd classes
+    returns the body a genotype of 3 vectors of 64 floats each
+    Here to make a body evolutionary algorithms are used
+    so DE for example
+    """
+    pass
+
+
+
+def trainNet():
+    """
+    Takes input of an NN and trains it to the max fitness
+    and returns the trained net and fitness 
+    
+    """
+    return 0.0, 0.0
+
+def initializePopulation(pop_size: int):
+    """
+    initializes a population of pop_size individuals
+    each individual is a tuple of (genotype, neural network)
+    genotype is a list of 3 vectors of 64 floats each
+    neural network is a neural network that takes in the positions of the joints and outputs
+    new positions for the joints
+    with the hidden layers etc predefined
+    
+    returns a list of individuals
+    """
+    population = []
+    for _ in range(pop_size):
+        genotype = makeBody() #unique bodies
+        neural_net = makeNeuralNetwork(input_size=genotype, output_size=genotype)
+        trained_net, fitness = trainNet(neural_net)
+        population.append((genotype, neural_net, fitness))
+    return population
+
+
+
+def makePopulation(): #start of evolutionary algorithm
+    
+    """
+    This is the first step of the evolutionary algorithm.
+    Create a population of genotypes (bodies).
+    uses the function makebody and makeneuralnetwork
+    then trains the neural network in the function train net
+    and returns the fitness of each individual in the population
+    and the genotype and neural network of each individual in the population
+    
+    This is done for each individual in the population
+    and the population is return with fitness, genotype and neural network
+    
+    
+    """
+    pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def show_xpos_history(history: list[float]) -> None:
     # Convert list of [x,y,z] positions to numpy array
     pos_data = np.array(history)
@@ -214,10 +313,10 @@ def main() -> None:
         type_p_genes,
         conn_p_genes,
         rot_p_genes,
-    ]
+    ] #evolution on this 
 
     nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
-    p_matrices = nde.forward(genotype)
+    p_matrices = nde.forward(genotype) #not the p_matrices
 
     # Decode the high-probability graph
     hpd = HighProbabilityDecoder(num_modules)
@@ -236,7 +335,7 @@ def main() -> None:
 
     # ? ------------------------------------------------------------------ #
     # Print all nodes
-    core = construct_mjspec_from_graph(robot_graph)
+    core = construct_mjspec_from_graph(robot_graph) # this is the gecko but now called core
 
     # ? ------------------------------------------------------------------ #
     mujoco_type_to_find = mj.mjtObj.mjOBJ_GEOM
