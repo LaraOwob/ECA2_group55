@@ -1,10 +1,4 @@
-"""
-Tilted flat terrain with a specified tilt angle and axis.
-
-Date:       2025-07-28
-Status:     Completed ✅
-Author:     A-lamo (Aron F.)
-"""
+"""Tilted flat terrain with a specified tilt angle and axis."""
 
 # Third-party libraries
 import mujoco
@@ -18,7 +12,15 @@ USE_DEGREES = False
 
 
 def quaternion_from_axis_angle(axis: str, angle_deg):
-    """Compute a unit quaternion from an axis and angle (degrees)."""
+    """Compute a unit quaternion from an axis and angle (degrees).
+
+    Parameters
+    -----------
+    axis : str[x|y|z]
+        Which of the 3 axis to turn in to quaternion.
+    angle_deg : float
+        Number of degrees for the axis.
+    """
     if axis == "x":
         axis = [1, 0, 0]
     elif axis == "y":

@@ -1,14 +1,4 @@
-"""
-Boxes extrude from the ground to form a terrain.
-
-TODO: Parameters:
-
-Date:       2025-07-28
-Author:     A-lamo (Aron F.)
-References: mjspec.ipynb
-Status:     Completed ✅
-
-"""
+"""Boxes extrude from the ground to form a terrain."""
 
 # Third-party libraries
 import random
@@ -121,7 +111,7 @@ class BoxyRugged:
             The position (x, y, z) to spawn the robot at, by default (0, 0, 0)
         small_gap : float, optional
             A small gap to add to the spawn position, by default 0.0
-        correct_for_bounding_box : bool, optional
+        correct_for_bounding_box : bool
             If True, the spawn position will be adjusted to account for the robot's bounding box,
             by default True
         """

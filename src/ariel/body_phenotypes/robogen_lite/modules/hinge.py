@@ -1,8 +1,5 @@
 """TODO(jmdm): description of script.
 
-Date:       2025-07-08
-Status:     Completed ✅
-
 Todo:
 ----
     [ ] ".rotate" as superclass method?
@@ -42,7 +39,13 @@ class HingeModule(Module):
     module_type: str = ModuleType.HINGE
 
     def __init__(self, index: int) -> None:
-        """Initialize the brick module."""
+        """Initialize the brick module.
+
+        Parameters
+        ----------
+        index : int
+            The index of the hinge module being instantiated
+        """
         # Set the index of the module
         self.index = index
 
@@ -135,7 +138,10 @@ class HingeModule(Module):
             biasprm=biasprm,
             trntype=trntype,
             target=servo_name,
-            ctrlrange=(-np.pi/2, np.pi/2),  # [-90, 90] degrees (range of 180)
+            ctrlrange=(
+                -np.pi / 2,
+                np.pi / 2,
+            ),  # [-90, 90] degrees (range of 180)
         )
 
         # Save model specifications
@@ -153,7 +159,7 @@ class HingeModule(Module):
         Parameters
         ----------
         angle : float
-            The angle in radians to rotate the hinge.
+            The angle in degrees to rotate the hinge.
         """
         # Convert angle to quaternion
         quat = qnp.from_euler_angles([

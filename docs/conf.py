@@ -31,8 +31,8 @@ autosectionlabel_prefix_document = True
 # --------- SHIBUYA --------- #
 templates_path = ["_templates"]
 # html_title =
-# html_logo =
-# html_favicon =
+# html_logo = 
+html_favicon = "resources/ariel_favicon.ico"
 
 # --------- MYST --------- #
 myst_enable_extensions = [
@@ -111,7 +111,7 @@ autodoc_default_options: dict[str, bool | str | list[str]] = {
 napoleon_attr_annotations = True
 napoleon_google_docstring = True
 napoleon_include_init_with_doc = True
-napoleon_include_private_with_doc = True
+napoleon_include_private_with_doc = False
 napoleon_include_special_with_doc = True
 napoleon_numpy_docstring = True
 napoleon_preprocess_types = True

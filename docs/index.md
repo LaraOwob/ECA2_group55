@@ -1,8 +1,9 @@
 :layout: landing
 
-# Ariel Documentation
+# ARIEL - A Robot Evolution Framework
 
-![Ariel Logo](../resources/ariel_header_rounded.jpg)
+![Ariel Logo](resources/ariel_logo.svg)
+
 
 Ariel is a Python package, similar to Revolve, that provides efficient and easy-to-use tools for many aspects of evolutionary computing and evolutionary robotics.  
 It is designed with a clear API, sensible defaults, and support for both beginners and advanced users.
@@ -24,7 +25,7 @@ Get started below, or explore the full documentation for more details.
 
 ## Installation Information
 
-See the [installation guide](installation_guide.md) for more details.
+See the [installation guide](source/installation_guide.md) for more details.
 
 ---
 
@@ -40,6 +41,7 @@ Installation Guide <source/installation_guide>
 Evolutionary Computing Course Documentation <source/ec_course_docs>
 GUI <source/GUI>
 Your first EA with ARIEL <source/ea_intro/ea_example>
+MuJoCo Data Variables Documentation <source/Mujoco_docs/mujoco_docs>
 ```
 ---
 
@@ -49,6 +51,3 @@ Copyright (c) 2025, Ariel.
 All rights reserved.
 
 ---
-
-> **TODO**  
-> - Add sections on robots, evolution, and robot evolution
