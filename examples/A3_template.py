@@ -42,10 +42,17 @@ from ariel.simulation.controllers.controller import Controller
 from ariel.simulation.environments import OlympicArena
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
+from stable_baselines3 import SAC
+import gym
+from gym import spaces
+
+
 
 # Type Checking
 if TYPE_CHECKING:
     from networkx import DiGraph
+print("helololololololo")
+
 
 # Type Aliases
 type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
@@ -223,6 +230,58 @@ def evaluateFitness(
 
 
 
+
+class OlympicEnv(gym.Env):
+    def __init__(self, robot,world):
+        super().__init__()
+        # Init world + robot
+        mj.set_mjcb_control(None)
+        self.world = world
+
+        # Build MuJoCo model/data
+        self.model = self.world.spec.compile()
+        self.data = mj.MjData(self.model)
+
+        # Action/obs spaces
+        self.n_actions = self.model.nu
+        self.n_obs = self.model.nq + self.model.nv
+        self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_actions,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.n_obs,), dtype=np.float32)
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        mj.mj_resetData(self.model, self.data)
+        return self._get_obs(), {}
+
+    def step(self, action):
+        self.data.ctrl[:] = action
+        mj.mj_step(self.model, self.data)
+        obs = self._get_obs()
+
+        reward = self._compute_reward(obs, action)
+        done = self._check_done()
+        truncated = False
+
+        return obs, reward, done, truncated, {}
+
+    def _get_obs(self):
+        return np.concatenate([self.data.qpos, self.data.qvel]).astype(np.float32)
+
+    def _compute_reward(self, obs, action):
+        # Placeholder: define task-specific reward
+        return -np.linalg.norm(obs)
+
+    def _check_done(self):
+        # Placeholder: define when episode ends
+        return False
+
+
+
+
+
+
+
+
 def train_Net(
     model: mj.MjModel,
     world: OlympicArena,
@@ -237,7 +296,12 @@ def train_Net(
     for name, param in nn_obj.named_parameters():
             print(name, param.shape)
             print(param) 
-
+    nnModel = SAC("MlpPolicy", env=OlympicEnv(core,world), verbose=1)
+    nnModel.learn(total_timesteps=10000)
+    
+    print("did that run")
+    
+    """
     for _ in range(iterations):
         # Evaluate current fitness
         
@@ -255,9 +319,14 @@ def train_Net(
                 else:
                     baseline = new_fitness
     print(baseline)
-    return nn_obj, baseline
+    """
+    return nn_obj#, baseline
 
 
+def TrainDummyNet(nn_obj: NNController):    
+    RNG = np.random.default_rng(SEED)
+    fitness = RNG.random()
+    return None, fitness
 # ----------------------------
 # Population Initialization
 # ----------------------------
@@ -278,7 +347,8 @@ def initializePopulation(pop_size: int = 10, num_modules: int = 20):
         target_pos = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
         # Train and evaluate
-        trained_nn, fitness = train_Net(model, world, nn_obj, core, target_pos, duration = 5.0, iterations=50, lr=0.01)
+        trained_nn, fitness = TrainDummyNet(nn_obj)
+        #train_Net(model, world, nn_obj, core, target_pos, duration = 5.0, iterations=50, lr=0.01)
 
         population.append({
             "genotype": genotype,
