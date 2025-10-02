@@ -329,10 +329,12 @@ def train_Net(
     return nn_obj#, baseline
 
 
-def TrainDummyNet(nn_obj: NNController):    
-    RNG = np.random.default_rng(SEED)
+
+def TrainDummyNet(nn_obj: NNController):   
+    RNG = np.random.default_rng()  # No fixed seed
     fitness = RNG.random()
     return None, fitness
+
 
 
 def mutation(a,b,c,F):
