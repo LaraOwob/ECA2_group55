@@ -46,7 +46,9 @@ from stable_baselines3 import SAC
 import gym
 from gym import spaces
 
-
+import cma
+from scipy.optimize import differential_evolution
+import pyswarms as ps
 
 # Type Checking
 if TYPE_CHECKING:
@@ -327,6 +329,59 @@ def TrainDummyNet(nn_obj: NNController):
     RNG = np.random.default_rng(SEED)
     fitness = RNG.random()
     return None, fitness
+
+
+
+
+#DE
+def DeMethod(fitnessscore,dim):
+    result = differential_evolution(fitness, bounds=[(-5, 5)] * dim, maxiter=50)
+    print("Best solution:", result.x)
+    return result.x
+
+
+#CMAES
+def CMAESmethod(fitness,dim):
+    es = cma.CMAEvolutionStrategy(dim * [0], 0.5)  # mean, sigma
+    es.optimize(fitness, iterations=50)
+    print("Best solution:", es.result.xbest)
+    return es.result.xbest
+
+
+def PSOmethod(fitness,dim):
+    
+    options = {'c1': 1.5, 'c2': 1.5, 'w': 0.7}
+    optimizer = ps.single.GlobalBestPSO(n_particles=20, dimensions=dim, options=options)
+    best_cost, best_pos = optimizer.optimize(fitness, iters=50)
+    print("Best PSO solution:", best_pos)
+
+def MapElites(fitness, dim):
+    # Archive: 2D map based on (mean vec1, mean vec2)
+    archive = GridArchive(
+    dims=[10, 10],  # 10x10 grid
+    ranges=[(-1,1), (-1,1)],  # descriptors
+    learning_rate=1.0,
+    )
+
+    emitter = GaussianEmitter(archive, x0=np.zeros(dim), sigma=0.1)
+    opt = Optimizer([emitter])
+
+    for gen in range(100):
+        sols = opt.ask()
+        fits, descs = zip(*[evaluate(s) for s in sols])
+        opt.tell(sols, fits, descs)
+
+    best = archive._solutions[np.argmax(archive.f)]
+    print("Best MAP-Elites fitness:", np.max(archive.f))
+
+
+
+def evaluate(x):
+    indiv = [x[:vec_dim], x[vec_dim:2*vec_dim], x[2*vec_dim:]]
+    fit = evaluateFitness(model, world, nn_obj, core, target_pos, duration)
+    desc = [np.mean(indiv[0]), np.mean(indiv[1])]
+    return fit, desc
+
 # ----------------------------
 # Population Initialization
 # ----------------------------
