@@ -45,7 +45,7 @@ from ariel.utils.tracker import Tracker
 from stable_baselines3 import SAC
 import gym
 from gym import spaces
-
+import os
 import cma
 from scipy.optimize import differential_evolution
 import pyswarms as ps
@@ -329,6 +329,112 @@ def TrainDummyNet(nn_obj: NNController):
     RNG = np.random.default_rng(SEED)
     fitness = RNG.random()
     return None, fitness
+
+
+def mutation(a,b,c,rate,F):
+    #mutant = pop[a] + F * (pop[b] - pop[c])
+    individual = []
+    for vector in range(3):
+        for gene in range(64):
+            individual[vector][gene] = a[vector][gene] + F * (b[vector][gene] - c[vector][gene])
+    return individual
+
+def crossover(parent, mutant, CR, vector_size=3, gene_size=64):
+    """
+    Make a crossover between the parent and the mutant per vector
+    so that each vector has at least one gene from the mutant
+    
+    """
+    rng = np.random.default_rng(SEED)
+    trial = []
+    for i in range(vector_size):
+        cross = rng.random(gene_size) < CR
+        cross[rng.integers(0, gene_size)] = True 
+        trial_vector = np.where(cross, mutant[i], parent[i])
+        trial[i] = trial_vector
+    
+    return trial
+
+
+#  Differential Evolution on MLP (1b)
+def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=None, data=None, core_bind=None,
+                 hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, alpha=0.2):
+    """
+    Simple, Differential Evolution for MLP parameters.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Initialize population by sampling normal distribution with mean 0 and stdv of init_scale
+    pop = initializePopulation(pop_size=pop_size, num_modules=20)
+    #Initialize empty numby array with length number of candidates
+    fits = np.empty(pop_size, dtype=np.float64)
+
+    # Calculate fitness for each candidate, pop[i] = candidate
+    for i in range(pop_size):
+        #evaluate_mlp_headless(pop[i], model, data, core_bind, T=T, hidden=hidden, freq_hz=freq_hz, alpha=alpha)
+        fits[i] = pop[i]["fitness"] 
+
+    #Finds best fitnesses
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    best_idx = int(np.argmax(fits))
+    best_candidate = pop[best_idx].copy()
+    best_fit = float(fits[best_idx])
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
+        for g in range(generations):
+            for i in range(pop_size):
+                #Select all indices expcept for i, the candidate you want to mutate
+                choices = []
+                for index in range(pop_size):
+                    if index != i:
+                        choices.append(index)
+                #Out of valid choices, choose 3 random candidates 
+                a, b, c = rng.choice(choices, size=3, replace=False)
+                #Mutant candidate:
+                
+                #mutant = pop[a] + F * (pop[b] - pop[c])
+                mutant = mutation(pop[a]["genotype"],pop[b]["genotype"],pop[c]["genotype"],F)
+                # Crossover (binomial), between parent and mutant
+                #Creates list of length weights whether each gene will be changed or stays like parent. Returns FAlse or True list
+                cross = rng.random(number_params) < CR
+                #At least one random gene will be open for crossover with mutant
+                cross[rng.integers(0, number_params)] = True 
+                #The genes which were chosen by cross validation proability are adjusted
+                trial = np.where(cross, mutant, pop[i])
+
+                # Evaluate trial
+                loss = evaluate_mlp_headless(trial, model, data, core_bind, T=T, hidden=hidden, freq_hz=freq_hz, alpha=alpha)
+                f_trial = -loss
+
+                # If trial is better than parent than trial enters population
+                if f_trial >= fits[i]:
+                    pop[i] = trial
+                    fits[i] = f_trial
+
+            # Retrieve stats: best fitness, mean fitness and median fitness and write to csv
+            gen_best = float(np.max(fits))
+            gen_mean = float(np.mean(fits))
+            gen_median = float(np.median(fits))
+            writer.writerow([g, gen_best, gen_mean, gen_median])
+
+            # Update and check best candidate with best fitness
+            if gen_best > best_fit:
+                best_fit = gen_best
+                best_candidate = pop[int(np.argmax(fits))].copy()
+
+            #Print every after every 10th generation
+            if (g + 1) % max(1, generations // 10) == 0:
+                print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
+
+    return best_candidate, best_fit
+
+
+
+
+
+
 
 
 
