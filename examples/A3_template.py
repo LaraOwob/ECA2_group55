@@ -42,14 +42,13 @@ from ariel.simulation.controllers.controller import Controller
 from ariel.simulation.environments import OlympicArena
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
-from stable_baselines3 import SAC
+#from stable_baselines3 import SAC
 import gym
 from gym import spaces
 import os
 import cma
 from scipy.optimize import differential_evolution
-import pyswarms as ps
-
+import csv
 # Type Checking
 if TYPE_CHECKING:
     from networkx import DiGraph
@@ -104,13 +103,9 @@ class NNController(nn.Module):
 # ----------------------------
 # Body Creation
 # ----------------------------
-def makeBody(num_modules: int = 20):
-    genotype_size = 64
-    type_p = RNG.random(genotype_size).astype(np.float32)
-    conn_p = RNG.random(genotype_size).astype(np.float32)
-    rot_p = RNG.random(genotype_size).astype(np.float32)
-    genotype = [type_p, conn_p, rot_p]
 
+
+def makeBody(num_modules: int = 20, genotype=None):
     nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
     p_matrices = nde.forward(genotype)
 
@@ -121,9 +116,18 @@ def makeBody(num_modules: int = 20):
 
     core = construct_mjspec_from_graph(robot_graph)
 
+    return core
 
+def makeGenotype(num_modules: int = 20):
+    genotype_size = 64
+    type_p = RNG.random(genotype_size).astype(np.float32)
+    conn_p = RNG.random(genotype_size).astype(np.float32)
+    rot_p = RNG.random(genotype_size).astype(np.float32)
+    genotype = [type_p, conn_p, rot_p]
+    body = makeBody(num_modules, genotype)
+    
 
-    return core, genotype
+    return body, genotype
 
 
 # ----------------------------
@@ -298,8 +302,8 @@ def train_Net(
     for name, param in nn_obj.named_parameters():
             print(name, param.shape)
             print(param) 
-    nnModel = SAC("MlpPolicy", env=OlympicEnv(core,world), verbose=1)
-    nnModel.learn(total_timesteps=10000)
+    #nnModel = SAC("MlpPolicy", env=OlympicEnv(core,world), verbose=1)
+    #nnModel.learn(total_timesteps=10000)
     
     print("did that run")
     
@@ -331,13 +335,14 @@ def TrainDummyNet(nn_obj: NNController):
     return None, fitness
 
 
-def mutation(a,b,c,rate,F):
+def mutation(a,b,c,F):
     #mutant = pop[a] + F * (pop[b] - pop[c])
-    individual = []
+    mutant_genotye = [np.zeros(64)]*3
     for vector in range(3):
         for gene in range(64):
-            individual[vector][gene] = a[vector][gene] + F * (b[vector][gene] - c[vector][gene])
-    return individual
+            difference = b[vector][gene] - c[vector][gene]
+            mutant_genotye[vector][gene] = a[vector][gene] + F * difference
+    return mutant_genotye
 
 def crossover(parent, mutant, CR, vector_size=3, gene_size=64):
     """
@@ -346,14 +351,14 @@ def crossover(parent, mutant, CR, vector_size=3, gene_size=64):
     
     """
     rng = np.random.default_rng(SEED)
-    trial = []
+    crossover_genotype =[]
     for i in range(vector_size):
         cross = rng.random(gene_size) < CR
         cross[rng.integers(0, gene_size)] = True 
         trial_vector = np.where(cross, mutant[i], parent[i])
-        trial[i] = trial_vector
+        crossover_genotype.append(trial_vector)
     
-    return trial
+    return crossover_genotype
 
 
 #  Differential Evolution on MLP (1b)
@@ -365,15 +370,8 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
     rng = np.random.default_rng(seed)
 
     # Initialize population by sampling normal distribution with mean 0 and stdv of init_scale
-    pop = initializePopulation(pop_size=pop_size, num_modules=20)
-    #Initialize empty numby array with length number of candidates
-    fits = np.empty(pop_size, dtype=np.float64)
-
-    # Calculate fitness for each candidate, pop[i] = candidate
-    for i in range(pop_size):
-        #evaluate_mlp_headless(pop[i], model, data, core_bind, T=T, hidden=hidden, freq_hz=freq_hz, alpha=alpha)
-        fits[i] = pop[i]["fitness"] 
-
+    pop,fits = initializePopulation(pop_size=pop_size, num_modules=20)
+    print("made population")
     #Finds best fitnesses
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     best_idx = int(np.argmax(fits))
@@ -393,20 +391,12 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
                 #Out of valid choices, choose 3 random candidates 
                 a, b, c = rng.choice(choices, size=3, replace=False)
                 #Mutant candidate:
-                
-                #mutant = pop[a] + F * (pop[b] - pop[c])
                 mutant = mutation(pop[a]["genotype"],pop[b]["genotype"],pop[c]["genotype"],F)
-                # Crossover (binomial), between parent and mutant
-                #Creates list of length weights whether each gene will be changed or stays like parent. Returns FAlse or True list
-                cross = rng.random(number_params) < CR
-                #At least one random gene will be open for crossover with mutant
-                cross[rng.integers(0, number_params)] = True 
-                #The genes which were chosen by cross validation proability are adjusted
-                trial = np.where(cross, mutant, pop[i])
-
+                trial = crossover(pop[i]["genotype"], mutant, CR, vector_size=3, gene_size=64)
                 # Evaluate trial
-                loss = evaluate_mlp_headless(trial, model, data, core_bind, T=T, hidden=hidden, freq_hz=freq_hz, alpha=alpha)
-                f_trial = -loss
+                trialbody = makeBody(num_modules=20, genotype=trial)
+                trialindividual = makeIndividual(trialbody,trial)
+                f_trial = -trialindividual["fitness"] #fitness is negative distance to target
 
                 # If trial is better than parent than trial enters population
                 if f_trial >= fits[i]:
@@ -434,34 +424,29 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
 
 
 
-
-
-
-
-
 #DE
-def DeMethod(fitnessscore,dim):
+def DeMethod(fitnessscore,dim): #maybe delete depends on the other method
     result = differential_evolution(fitness, bounds=[(-5, 5)] * dim, maxiter=50)
     print("Best solution:", result.x)
     return result.x
 
 
 #CMAES
-def CMAESmethod(fitness,dim):
+def CMAESmethod(fitness,dim): #still to finish
     es = cma.CMAEvolutionStrategy(dim * [0], 0.5)  # mean, sigma
     es.optimize(fitness, iterations=50)
     print("Best solution:", es.result.xbest)
     return es.result.xbest
 
 
-def PSOmethod(fitness,dim):
+def PSOmethod(fitness,dim): # still to finish
     
     options = {'c1': 1.5, 'c2': 1.5, 'w': 0.7}
     optimizer = ps.single.GlobalBestPSO(n_particles=20, dimensions=dim, options=options)
     best_cost, best_pos = optimizer.optimize(fitness, iters=50)
     print("Best PSO solution:", best_pos)
 
-def MapElites(fitness, dim):
+def MapElites(fitness, dim): #still to finish
     # Archive: 2D map based on (mean vec1, mean vec2)
     archive = GridArchive(
     dims=[10, 10],  # 10x10 grid
@@ -488,37 +473,44 @@ def evaluate(x):
     desc = [np.mean(indiv[0]), np.mean(indiv[1])]
     return fit, desc
 
+
+def makeIndividual(body,genotype):
+    #Create a body
+    #Spawn core to get model, for nu
+    mj.set_mjcb_control(None)
+    world = OlympicArena()
+    world.spawn(body.spec, spawn_position=[2.0, 0, 0.1], correct_for_bounding_box=False)
+    model = world.spec.compile() 
+    nu = model.nu
+    #Pass numm hinges as inputsize NN 
+    nn_obj = makeNeuralNetwork(nu=nu, hidden_size=8)
+    #Set target_position
+    target_pos = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    # Train and evaluate
+    trained_nn, fitness = TrainDummyNet(nn_obj)
+    #train_Net(model, world, nn_obj, core, target_pos, duration = 5.0, iterations=50, lr=0.01)
+    individual ={
+            "genotype": genotype,
+            "robot_spec": body,
+            "nn": trained_nn,
+            "fitness": fitness
+        }
+    return individual
 # ----------------------------
 # Population Initialization
 # ----------------------------
 def initializePopulation(pop_size: int = 10, num_modules: int = 20):
     population = []
+    all_fitness = []
     for _ in range(pop_size):
-        #Create a body
-        core, genotype = makeBody(num_modules)
-        #Spawn core to get model, for nu
-        mj.set_mjcb_control(None)
-        world = OlympicArena()
-        world.spawn(core.spec, spawn_position=[2.0, 0, 0.1], correct_for_bounding_box=False)
-        model = world.spec.compile() 
-        nu = model.nu
-        #Pass numm hinges as inputsize NN 
-        nn_obj = makeNeuralNetwork(nu=nu, hidden_size=8)
-        #Set target_position
-        target_pos = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        core, genotype = makeGenotype(num_modules)
 
-        # Train and evaluate
-        trained_nn, fitness = TrainDummyNet(nn_obj)
-        #train_Net(model, world, nn_obj, core, target_pos, duration = 5.0, iterations=50, lr=0.01)
-
-        population.append({
-            "genotype": genotype,
-            "robot_spec": core,
-            "nn": trained_nn,
-            "fitness": fitness
-        })
-        print("Individual fitness:", fitness)
-    return population
+        indiv = makeIndividual(core,genotype)
+        all_fitness.append(indiv["fitness"])
+        population.append(indiv)
+        
+    return population, all_fitness
 
 
 # ----------------------------
@@ -557,12 +549,15 @@ def evolvePopulation(population, elite_fraction=0.2, mutation_rate=0.1):
 # Main Loop
 # ----------------------------
 def main():
+    print("Starting evolutionary algorithm...")
+    train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=10, pop_size=10, seed=SEED)
+    """
     population = initializePopulation(pop_size=10)
     for gen in range(5):
         population = evolvePopulation(population)
         best = max(population, key=lambda x: x["fitness"])
         print(f"Generation {gen}: Best fitness = {best['fitness']:.3f}")
-
+    """
 if __name__ == "__main__":
     main()
 
