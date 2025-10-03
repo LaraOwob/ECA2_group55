@@ -509,6 +509,7 @@ def makeIndividual(body,genotype):
 # Population Initialization
 # ----------------------------
 def initializePopulation(pop_size: int = 10, num_modules: int = 20):
+    # add unique bodies to the population
     population = []
     all_fitness = []
     for _ in range(pop_size):
