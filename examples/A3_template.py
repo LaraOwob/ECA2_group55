@@ -69,7 +69,7 @@ DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(exist_ok=True)
 
 CTRL_RANGE = 1.0
-
+BODY_COLLECTION = {}
 # ----------------------------
 # Neural Network Controller
 # ----------------------------
@@ -479,26 +479,32 @@ def evaluate(x):
 def makeIndividual(body,genotype):
     #Create a body
     #Spawn core to get model, for nu
-    mj.set_mjcb_control(None)
-    world = OlympicArena()
-    world.spawn(body.spec, spawn_position=[2.0, 0, 0.1], correct_for_bounding_box=False)
-    model = world.spec.compile() 
-    nu = model.nu
-    #Pass numm hinges as inputsize NN 
-    nn_obj = makeNeuralNetwork(nu=nu, hidden_size=8)
-    #Set target_position
-    target_pos = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    if body in BODY_COLLECTION:
+        return BODY_COLLECTION[body]
+    
+    else:
+        mj.set_mjcb_control(None)
+        world = OlympicArena()
+        world.spawn(body.spec, spawn_position=[2.0, 0, 0.1], correct_for_bounding_box=False)
+        model = world.spec.compile() 
+        nu = model.nu
+        #Pass numm hinges as inputsize NN 
+        nn_obj = makeNeuralNetwork(nu=nu, hidden_size=8)
+        #Set target_position
+        target_pos = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
-    # Train and evaluate
-    trained_nn, fitness = TrainDummyNet(nn_obj)
-    #train_Net(model, world, nn_obj, core, target_pos, duration = 5.0, iterations=50, lr=0.01)
-    individual ={
-            "genotype": genotype,
-            "robot_spec": body,
-            "nn": trained_nn,
-            "fitness": fitness
-        }
-    return individual
+        # Train and evaluate
+        
+        trained_nn, fitness = TrainDummyNet(nn_obj)
+        #train_Net(model, world, nn_obj, core, target_pos, duration = 5.0, iterations=50, lr=0.01)
+        individual ={
+                "genotype": genotype,
+                "robot_spec": body,
+                "nn": trained_nn,
+                "fitness": fitness
+            }
+        BODY_COLLECTION[body] = individual
+        return individual
 # ----------------------------
 # Population Initialization
 # ----------------------------
