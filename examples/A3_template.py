@@ -10,6 +10,8 @@ import mujoco as mj
 import numpy as np
 import numpy.typing as npt
 from mujoco import viewer
+from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
+from functools import partial
 
 # Local libraries
 from ariel.body_phenotypes.robogen_lite.constructor import (
@@ -22,6 +24,8 @@ from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
 from ariel.simulation.controllers.controller import Controller
 from ariel.simulation.environments import OlympicArena
+from ariel.simulation.environments import SimpleFlatWorld
+from ariel.simulation.environments import RuggedTerrainWorld
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
@@ -37,12 +41,14 @@ type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 # --- RANDOM GENERATOR SETUP --- #
 SEED = 42
 RNG = np.random.default_rng(SEED)
+TARGET_POS = np.array([1.9, 0.3, 0.1])
 
 # --- DATA SETUP ---
 SCRIPT_NAME = __file__.split("/")[-1][:-3]
 CWD = Path.cwd()
 DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(exist_ok=True)
+TOLERANCE = 0.1 
 
 
 def show_xpos_history(history: list[float]) -> None:
@@ -116,6 +122,580 @@ def nn_controller(
     return outputs * np.pi
 
 
+class MLPController:
+    """
+    Tiny MLP: [prev_ctrl (nu), sin(wt), cos(wt)] -> ctrl (nu)
+    Two layers: (in_dim -> hidden) -> (hidden -> out_dim) with tanh activations.
+    Output is scaled to [-CTRL_RANGE, CTRL_RANGE].
+    """
+    def __init__(self, nu: int, hidden: int = 32, freq_hz: float = 1.0):
+        self.nu = nu
+        self.hidden = hidden
+        self.in_dim = nu + 4
+        self.out_dim = nu
+        self.freq_hz = freq_hz
+        # Parameter shapes
+        self.W1_shape = (self.in_dim, hidden)
+        self.b1_shape = (hidden,)
+        self.W2_shape = (hidden, self.out_dim)
+        self.b2_shape = (self.out_dim,)
+        self.n_params = (
+            self.in_dim*self.hidden +
+            self.hidden +
+            self.hidden*self.out_dim +
+            self.out_dim
+        )
+
+    def set_params(self, theta: np.ndarray):
+        #Checks length of solution, if it matches the expected number of parameters
+        assert theta.shape[0] == self.n_params
+        #Saves copy of solutoin, and saves in object
+        self.theta = theta.copy()
+
+    def _unpack(self):
+        #Retrieve solution (values)
+        t = self.theta
+        i = 0
+        #Unpacks solution in W1, b1, W2, b2
+        W1 = t[i:i+self.in_dim*self.hidden].reshape(self.in_dim, self.hidden); i += self.in_dim*self.hidden
+        b1 = t[i:i+self.hidden]; i += self.hidden
+        W2 = t[i:i+self.hidden*self.out_dim].reshape(self.hidden, self.out_dim); i += self.hidden*self.out_dim
+        b2 = t[i:i+self.out_dim]
+        return W1, b1, W2, b2
+    
+    #Applies forward pass and returns MLP output
+    def forward(self, prev_ctrl: np.ndarray, t: float, target_pos: np.ndarray, current_pos: np.ndarray) -> np.ndarray:
+        w = 2*np.pi*self.freq_hz
+        #includes the distance to target as input
+        delta = target_pos[:2] - current_pos[:2] 
+        obs = np.concatenate([prev_ctrl, [np.sin(w*t), np.cos(w*t)], delta], dtype=np.float64)
+        W1, b1, W2, b2 = self._unpack()
+        h = np.tanh(obs @ W1 + b1)
+        y = np.tanh(h @ W2 + b2)
+        return np.pi * y
+    
+
+def mlp_forward(model, data, network, core_bind, *args, **kwargs):
+    prev_ctrl = data.ctrl.copy()
+    current_pos = data.xpos[core_bind.id] # root position
+    t = data.time               # use actual simulation time
+    return network.forward(prev_ctrl, t, TARGET_POS, current_pos)
+
+
+def create_body():
+    num_modules = 20
+
+    # ? ------------------------------------------------------------------ #
+    genotype_size = 64
+    type_p_genes = RNG.random(genotype_size).astype(np.float32)
+    conn_p_genes = RNG.random(genotype_size).astype(np.float32)
+    rot_p_genes = RNG.random(genotype_size).astype(np.float32)
+
+    genotype = [
+        type_p_genes,
+        conn_p_genes,
+        rot_p_genes,
+    ]
+
+    nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
+    p_matrices = nde.forward(genotype)
+
+    # Decode the high-probability graph
+    hpd = HighProbabilityDecoder(num_modules)
+    robot_graph: DiGraph[Any] = hpd.probability_matrices_to_graph(
+        p_matrices[0],
+        p_matrices[1],
+        p_matrices[2],
+    )
+
+    # ? ------------------------------------------------------------------ #
+    # Save the graph to a file
+    save_graph_as_json(
+        robot_graph,
+        DATA / "robot_graph.json",
+    )
+
+    # ? ------------------------------------------------------------------ #
+    # Print all nodes
+    core = construct_mjspec_from_graph(robot_graph)
+    core = gecko()
+    return core
+
+def create_tracker():
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
+    return tracker
+
+
+def evaluate_fitness(candidate, model, data, ctrl, network, core_bind, duration=30.0):
+    
+    """
+    Evaluate MLP controller fitness using the simulation runner and Controller class.
+    
+    Parameters
+    ----------
+    model : mujoco.MjModel
+    data : mujoco.MjData
+    ctrl : Controller
+        Controller instance to use for simulation.
+    network : MLPController
+        MLP network providing forward() method.
+    duration : float
+        Simulation duration in seconds.
+    
+    Returns
+    -------
+    float
+        Fitness (higher is better).
+    """
+    network.set_params(candidate)
+
+    # Reset simulation
+    mj.mj_resetData(model, data)
+    
+    # Assign network forward as controller callback
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind = core_bind)
+    
+    # Set controller in MuJoCo
+    mj.set_mjcb_control(ctrl.set_control)
+    
+    # Run simulation
+    simple_runner(model, data, duration=duration)
+    
+
+    dist = np.linalg.norm(data.xpos[core_bind.id] - TARGET_POS)
+    
+    # Fitness: inverse of distance (closer is better)
+    fitness = 1.0 / (dist + 1e-6)  # add epsilon to avoid div by zero
+
+    
+    return fitness
+
+
+def evaluate_fitness2(candidate, model, data, ctrl, network, core_bind, duration=15, alpha=0.2):
+    network.set_params(candidate)
+
+    # Reset simulation
+    mj.mj_resetData(model, data)
+
+    # Assign network forward as controller callback
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind = core_bind)
+    mj.set_mjcb_control(ctrl.set_control)
+
+    # Initialize tracking
+    nu = model.nu
+    prev_ctrl = np.zeros(nu, dtype=np.float64)
+    energy_acc = 0.0
+    smooth_acc = 0.0
+    reached = False
+    time_to_target = duration
+
+    # Wrap controller to log energy and smoothness during simple_runner
+    original_forward = network.forward
+
+     # Wrap network.forward to log energy, smoothness, and reaching
+    def logging_forward(model_inner, data_inner, *args, **kwargs):
+        nonlocal prev_ctrl, energy_acc, smooth_acc, reached, time_to_target
+
+        # Current position
+        current_pos = data_inner.xpos[core_bind.id].copy()
+        t = data_inner.time
+
+        # Compute control
+        ctrl_out = network.forward(prev_ctrl, t, TARGET_POS, current_pos)
+        ctrl_val = (1 - alpha) * prev_ctrl + alpha * ctrl_out
+
+        # Update accumulators
+        energy_acc += float(np.mean(np.abs(ctrl_val)))
+        smooth_acc += float(np.mean(np.abs(ctrl_val - prev_ctrl)))
+        prev_ctrl[:] = ctrl_val
+
+        # Check if reached
+        dist = np.linalg.norm(current_pos[:2] - TARGET_POS[:2])
+        if (not reached) and dist < TOLERANCE:
+            reached = True
+            time_to_target = t
+
+        return ctrl_val
+
+
+    # Replace network forward temporarily
+    ctrl.controller_callback_function = logging_forward
+
+    # Run simulation
+    simple_runner(model, data, duration=duration)
+
+    # Compute final distance
+    final_dist = np.linalg.norm(data.xpos[core_bind.id, :2] - TARGET_POS[:2])
+    start_pos = data.xpos[0, :].copy()  # full 3D position of the root/body
+    initial_dist = np.linalg.norm(start_pos[:2] - TARGET_POS[:2]) 
+    # Fitness: higher if reached quickly, smoother, and energy-efficient
+    initial_dist = np.linalg.norm(start_pos[:2] - TARGET_POS[:2])
+    final_dist = np.linalg.norm(data.xpos[0, :2] - TARGET_POS[:2])
+    progress = (initial_dist - final_dist) / (initial_dist + 1e-6)  # 0 to 1 scale
+
+    max_reward = 1.0
+    if reached:
+        progress = 1.0  # reached
+        time_factor = (duration - time_to_target) / duration  # 0-1
+        fitness = max_reward * (0.8 * progress + 0.2 * time_factor) - 0.05 * energy_acc - 0.05 * smooth_acc
+    else:
+        progress = (initial_dist - final_dist) / (initial_dist + 1e-6)  # 0-1
+        fitness = max_reward * progress - 0.05 * energy_acc - 0.05 * smooth_acc
+
+    return fitness
+
+
+def evaluate_fitness3(candidate, model, data, ctrl, network, core_bind, duration=15, alpha=0.2):
+    """
+    Evaluate MLP controller fitness using the simulation runner and Controller class.
+    
+    Parameters
+    ----------
+    model : mujoco.MjModel
+    data : mujoco.MjData
+    ctrl : Controller
+        Controller instance to use for simulation.
+    network : MLPController
+        MLP network providing forward() method.
+    duration : float
+        Simulation duration in seconds.
+    
+    Returns
+    -------
+    float
+        Fitness (higher is better).
+    """
+    # Reset simulation
+    mj.mj_resetData(model, data)
+    
+    # Assign network forward as controller callback
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind = core_bind)
+    
+    # Set controller in MuJoCo
+    mj.set_mjcb_control(ctrl.set_control)
+    
+    # Run simulation
+    simple_runner(model, data, duration=duration)
+    
+    # Compute final distance to target (2D)
+    delta_to_target = TARGET_POS[:2] - data.xpos[core_bind.id][:2]
+    distance = np.linalg.norm(delta_to_target)
+    
+    # Fitness: inverse of distance (closer is better)
+    fitness = 1.0 / (distance + 1e-6)  # add epsilon to avoid div by zero
+    
+   
+    return fitness
+
+
+
+
+import cma
+from functools import partial
+import numpy as np
+
+
+def train_mlp_cma(
+    generations=20,
+    pop_size=None,
+    T=30.0,
+    seed=50,
+    model=None,
+    data=None,
+    core_bind=None,
+    hidden=32,
+    freq_hz=1.0,
+    sigma=0.5,
+    init_scale=0.5,
+    tracker=None,
+    alpha=0.2,
+    world=None,
+):
+    """
+    CMA-ES optimization for MLP controller parameters.
+
+    Parameters
+    ----------
+    generations : int
+        Number of generations to run CMA-ES.
+    pop_size : int or None
+        Population size (lambda). Default = CMA-ES default.
+    T : float
+        Simulation duration.
+    model, data : mujoco.MjModel, mujoco.MjData
+        MuJoCo model and data.
+    core_bind : object
+        Object to track (e.g. body or geom reference).
+    hidden : int
+        Hidden layer size of MLP.
+    freq_hz : float
+        Controller frequency.
+    sigma : float
+        Initial standard deviation for CMA-ES.
+    init_scale : float
+        Initial parameter scaling.
+    tracker : Tracker or None
+        Optional tracking object.
+    alpha : float
+        Smoothing coefficient.
+    world : object
+        World/environment descriptor.
+
+    Returns
+    -------
+    best_params : np.ndarray
+        Best set of weights found.
+    best_fitness : float
+        Fitness value of best candidate.
+    """
+
+    rng = np.random.default_rng(seed)
+    np.random.seed(seed)
+
+    # Initialize MLP controller
+    nu = model.nu
+    network = MLPController(nu=nu, hidden=hidden, freq_hz=freq_hz)
+    num_params = network.n_params
+    mean_init = rng.normal(0.0, init_scale, size=num_params)
+
+    # Tracker setup
+    if tracker is not None and world is not None:
+        tracker.setup(world.spec, data)
+
+    # Controller wrapper
+    ctrl = Controller(
+        controller_callback_function=partial(mlp_forward, network=network, core_bind = core_bind),
+        tracker=tracker
+    )
+
+    # CMA-ES setup
+    es = cma.CMAEvolutionStrategy(mean_init, sigma, {
+        "popsize": pop_size,
+        "seed": seed,
+        "maxiter": generations,
+        "verb_disp": 1
+    })
+
+    best_candidate = None
+    best_fit = -np.inf
+
+    # Evolution loop
+    for gen in range(generations):
+        candidates = es.ask()
+        fitnesses = []
+
+        for cand in candidates:
+            fit = evaluate_fitness(cand, model, data, ctrl, network, T, core_bind, alpha = 0.2)
+            fitnesses.append(-fit)  # CMA minimizes, so negate
+
+        es.tell(candidates, fitnesses)
+        es.disp()
+
+        # CMA stores best solution internally
+        gen_best_fit = -min(fitnesses)
+        gen_best_candidate = candidates[int(np.argmin(fitnesses))]
+
+        if gen_best_fit > best_fit:
+            best_fit = gen_best_fit
+            best_candidate = gen_best_candidate.copy()
+
+        if (gen + 1) % max(1, generations // 10) == 0:
+            print(f"[mlp_cma seed {seed}] Gen {gen+1}/{generations}: best={gen_best_fit:.3f}")
+
+        if es.stop():
+            break
+
+    return best_candidate, best_fit
+
+
+
+
+
+
+
+
+def train_mlp_de(generations=20, pop_size=20, T=20, seed=50,
+                 model=None, data=None, core_bind=None,
+                 hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5,
+                 tracker=None, alpha=0.2, world = SimpleFlatWorld):
+    
+
+  
+    """
+    Simple, Differential Evolution for MLP parameters.
+    """
+    #Selects random number
+    # 
+    # 
+    # 
+    #  
+    rng = np.random.default_rng(seed)
+    print(model)
+    nu = model.nu
+    print(model.nu)
+    network = MLPController(nu=nu, hidden=32, freq_hz=1.0)
+    number_params = network.n_params
+    random_theta = rng.normal(0.0, 0.5, size=number_params)
+    network.set_params(random_theta)
+
+    
+
+    if tracker is not None:
+        tracker.setup(world.spec, data)
+    ctrl = Controller(
+        controller_callback_function=partial(mlp_forward, network=network, core_bind = core_bind),
+        tracker=tracker
+    )
+
+    # Initialize population by sampling normal distribution with mean 0 and stdv of init_scale
+    pop = rng.normal(loc=0.0, scale=init_scale, size=(pop_size,number_params ))
+    #Initialize empty numby array with length number of candidates
+    fits = np.empty(pop_size, dtype=np.float64)
+   
+
+    # Calculate fitness for each candidate, pop[i] = candidate
+    for i in range(pop_size):
+        fits[i] = evaluate_fitness3(pop[i], model, data, ctrl, network, core_bind, T, alpha=0.2)
+        #fits[i] = -loss  # fitness
+   
+    best_idx = int(np.argmax(fits))
+    best_candidate = pop[best_idx].copy()
+    best_fit = float(fits[best_idx])
+
+
+    for g in range(generations):
+        for i in range(pop_size):
+            #Select all indices expcept for i, the candidate you want to mutate
+            choices = []
+            for index in range(pop_size):
+                if index != i:
+                    choices.append(index)
+            #Out of valid choices, choose 3 random candidates 
+            a, b, c = rng.choice(choices, size=3, replace=False)
+            #Mutant candidate:
+            mutant = pop[a] + F * (pop[b] - pop[c])
+
+            # Crossover (binomial), between parent and mutant
+            #Creates list of length weights whether each gene will be changed or stays like parent. Returns FAlse or True list
+            cross = rng.random(number_params) < CR
+            #At least one random gene will be open for crossover with mutant
+            cross[rng.integers(0, number_params)] = True 
+            #The genes which were chosen by cross validation proability are adjusted
+            trial = np.where(cross, mutant, pop[i])
+
+            # Evaluate trial
+            f_trial = evaluate_fitness3(trial, model, data, ctrl, network,core_bind, T, alpha = 0.2)
+            #f_trial = -loss
+
+            # If trial is better than parent than trial enters population
+            if f_trial >= fits[i]:
+                pop[i] = trial
+                fits[i] = f_trial
+
+        # Retrieve stats: best fitness, mean fitness and median fitness and write to csv
+        gen_best = float(np.max(fits))
+        gen_mean = float(np.mean(fits))
+        gen_median = float(np.median(fits))
+
+        # Update and check best candidate with best fitness
+        if gen_best > best_fit:
+            best_fit = gen_best
+            best_candidate = pop[int(np.argmax(fits))].copy()
+
+        #Print every after every 10th generation
+        if (g + 1) % max(1, generations // 10) == 0:
+            print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
+
+    return best_candidate, best_fit
+
+
+def experiment2():
+    core = create_body()
+    tracker = create_tracker()
+
+    #Inialize world and model
+    mj.set_mjcb_control(None) 
+    world = SimpleFlatWorld()
+
+    # Spawn robot in the world
+    world.spawn(core.spec, spawn_position=[0, 0, 0.1])
+    world.spec.worldbody.add_geom(
+    type=mj.mjtGeom.mjGEOM_SPHERE,
+    name="target_marker",
+    size=[0.05, 0.0, 0.0],          
+    pos=TARGET_POS, 
+    rgba=[1, 0, 0, 1],  
+    contype=0,            
+    conaffinity=0)
+
+    # Generate the model and data
+    model = world.spec.compile()
+    data = mj.MjData(model)
+
+    # current_pos is the robot root position right after spawn
+    current_pos = data.xpos[0]  # shape (3,)
+
+    # Compute Euclidean distance to target (2D or 3D)
+    delta = TARGET_POS[:3] - current_pos  # or [:2] if you only care about XY
+    distance = np.linalg.norm(delta)
+
+    print("Distance to target after spawn:", distance)
+
+  
+    #Number of hinges
+    nu = model.nu
+    tracker.setup(core.spec, data)
+    core_bind = tracker.to_track[0]
+    theta, best_fit = train_mlp_de(
+                generations=20, pop_size=20, T=20, seed=5,
+                model=model, data=data, core_bind=core_bind,
+                hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, tracker = tracker, alpha = 0.2, world = world
+            )
+    #theta, best_fit = train_mlp_cma( generations=20,
+     #pop_size=50,
+     #T=10.0,
+     #seed=50,
+     #model=model,
+     #data=data,
+     #core_bind=core_bind,
+     #hidden=32,
+     #freq_hz=1.0,
+     #sigma=0.5,
+     #init_scale=0.5,
+     #tracker=tracker,
+     #alpha=0.2,
+     #world=world)
+    
+    mj.mj_resetData(model, data)
+    network = MLPController(nu=nu, hidden=32, freq_hz=1.0)
+    network.set_params(theta)
+    if tracker is not None:
+        tracker.setup(world.spec, data)
+
+    ctrl = Controller(
+        controller_callback_function=partial(mlp_forward, network=network, core_bind = core_bind),
+        tracker=tracker
+    )
+    
+    # Assign network forward as controller callback
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind = core_bind)
+    
+    # Set controller in MuJoCo
+    mj.set_mjcb_control(ctrl.set_control)
+    
+    # Run simulation
+    simple_runner(model, data, duration=50)
+
+    viewer.launch(model=model, data=data)
+    
+
+
+
+
+
+
+
+
 def experiment(
     robot: Any,
     controller: Controller,
@@ -129,7 +709,8 @@ def experiment(
 
     # Initialise world
     # Import environments from ariel.simulation.environments
-    world = OlympicArena()
+    #world = OlympicArena()
+    world = RuggedTerrainWorld()
 
     # Spawn robot in the world
     # Check docstring for spawn conditions
@@ -139,6 +720,34 @@ def experiment(
     # These are standard parts of the simulation USE THEM AS IS, DO NOT CHANGE
     model = world.spec.compile()
     data = mj.MjData(model)
+    current_pos = data.xpos[0]
+    print(current_pos)
+    print('okeee')
+
+    nu = model.nu
+
+    network = None
+    T = 10
+    rng = np.random.default_rng(50)
+    network = MLPController(nu = nu, hidden = 32, freq_hz = 1.0)
+    number_params = network.n_params
+    random_theta = rng.normal(loc=0.0, scale=0.5, size=number_params)
+
+
+    network.set_params(random_theta)
+
+   
+
+
+    prev_ctrl = data.ctrl.copy()
+    ctrl = Controller(network.forward,prev_ctrl, T, TARGET_POS, current_pos)
+    mj.set_mjcb_control(ctrl.set_control)
+    print('fine')
+    simple_runner(model, data, duration = 30)
+    print(simple_runner)
+     
+    print('yell focking yea')
+
 
     # Reset state and time of simulation
     mj.mj_resetData(model, data)
@@ -146,6 +755,8 @@ def experiment(
     # Pass the model and data to the tracker
     if controller.tracker is not None:
         controller.tracker.setup(world.spec, data)
+
+    
 
     # Set the control callback function
     # This is called every time step to get the next action.
@@ -155,6 +766,7 @@ def experiment(
     mj.set_mjcb_control(
         lambda m, d: controller.set_control(m, d, *args, **kwargs),
     )
+    print('heheh')
 
     # ------------------------------------------------------------------ #
     match mode:
@@ -245,6 +857,9 @@ def main() -> None:
         name_to_bind=name_to_bind,
     )
 
+
+
+
     # ? ------------------------------------------------------------------ #
     # Simulate the robot
     ctrl = Controller(
@@ -253,7 +868,8 @@ def main() -> None:
         tracker=tracker,
     )
 
-    experiment(robot=core, controller=ctrl, mode="launcher")
+    #experiment(robot=core, controller=ctrl, mode="simple")
+    experiment2()
 
     # show_xpos_history(tracker.history["xpos"][0])
 
