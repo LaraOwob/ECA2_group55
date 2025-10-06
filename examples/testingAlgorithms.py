@@ -52,7 +52,11 @@ import os
 import cma
 from scipy.optimize import differential_evolution
 import csv
-
+import numpy as np
+import csv
+import os
+import time
+import cma
 from pyswarm import pso
 
 # Type Checking
@@ -338,9 +342,56 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
     return best_candidate, best_fit
 
 
-#    #train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=10, pop_size=10, seed=SEED)
 
 
+def flatten_genotype(genotype):
+    """Flatten the genotype (3 vectors of size 64) into a single 192-element vector."""
+    return np.concatenate(genotype)
+
+def unflatten_genotype(flat_vector):
+    """Convert a 192-element vector back into a genotype (3 vectors of size 64)."""
+    return [flat_vector[0:64], flat_vector[64:128], flat_vector[128:192]]
+
+def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5):
+    """
+    CMA-ES for evolving robot genotypes with dummy fitness evaluation.
+    """
+    rng = np.random.default_rng(seed)
+    dim = 192  # 3 vectors of size 64
+    x0 = rng.random(dim)  # Initial mean
+    es = cma.CMAEvolutionStrategy(x0, sigma, {'popsize': pop_size, 'seed': seed})
+
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    best_fit = -np.inf
+    best_candidate = None
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
+
+        for g in range(generations):
+            solutions = es.ask()
+            fitnesses = []
+
+            for sol in solutions:
+                genotype = unflatten_genotype(np.clip(sol, 0, 1).astype(np.float32))
+                body = makeBody(num_modules=20, genotype=genotype)
+                individual = makeIndividual(body, genotype)
+                fitness = individual["fitness"]
+                fitnesses.append(-fitness)  # CMA-ES minimizes
+
+                if fitness > best_fit:
+                    best_fit = fitness
+                    best_candidate = individual
+
+            es.tell(solutions, fitnesses)
+
+            gen_best = float(np.max([-f for f in fitnesses]))
+            gen_mean = float(np.mean([-f for f in fitnesses]))
+            gen_median = float(np.median([-f for f in fitnesses]))
+            writer.writerow([g, gen_best, gen_mean, gen_median])
+
+    return best_candidate, best_fit
 
 
 def TrainDummyNet(nn_obj: NNController):   
@@ -360,10 +411,15 @@ def Testruntime():
         start_pso = time.time()
         best_candidate_PSO, best_fit_PSO = train_mlp_pso(out_csv=str(DATA / "mlp_pso3_results.csv"), generations=i, pop_size=10, seed=SEED)
         end_pso = time.time()
+        start_cmaes = time.time()
+        best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes("results/mlp_cmaes_results.csv", generations=i, pop_size=30, seed=42)
+        end_cmaes = time.time()
         print("Best DE candidate fitness:", best_fit_DE)
         print("Best PSO candidate fitness:", best_fit_PSO)
+        print("Best CMAES candidate fitness:", best_fit_CMAES)
         print("DE Time:", end_de - start_de, i/(end_de - start_de))
         print("PSO Time:", end_pso - start_pso, i/(end_pso - start_pso))
+        print("CMAES Time:", end_cmaes - start_cmaes, i/(end_cmaes - start_cmaes))
         
         SEED +=1
 
