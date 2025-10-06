@@ -344,15 +344,16 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
 
 
 def TrainDummyNet(nn_obj: NNController):   
-    RNG = np.random.default_rng()  # No fixed seed
+    RNG = np.random.default_rng(SEED)  # No fixed seed
     fitness = RNG.random()
     return None, fitness
 
 
 def Testruntime():
     print("Starting Test time...")
+    global SEED 
     for i in range(50,500,50):
-        print("Generations:", i)
+        print("Generations:", i,SEED)
         start_de = time.time()
         best_candidate_DE, best_fit_DE = train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=i, pop_size=10, seed=SEED)
         end_de = time.time()
@@ -361,9 +362,10 @@ def Testruntime():
         end_pso = time.time()
         print("Best DE candidate fitness:", best_fit_DE)
         print("Best PSO candidate fitness:", best_fit_PSO)
-        print("DE Time:", end_de - start_de)
-        print("PSO Time:", end_pso - start_pso)
-            
+        print("DE Time:", end_de - start_de, i/(end_de - start_de))
+        print("PSO Time:", end_pso - start_pso, i/(end_pso - start_pso))
+        
+        SEED +=1
 
 
 
