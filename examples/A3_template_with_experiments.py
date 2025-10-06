@@ -1,0 +1,952 @@
+"""Assignment 3 - Robot Olympics: Complete Implementation
+Evolves robot morphology (body) with Differential Evolution
+Optimizes controller (brain) with CMA-ES
+"""
+
+# Standard library
+from pathlib import Path
+from typing import Literal
+import os
+import csv
+
+# Third-party libraries
+#import matplotlib.pyplot as plt
+import mujoco as mj
+import numpy as np
+import torch
+import torch.nn as nn
+import cma # type: ignore
+from mujoco import viewer
+
+# Local libraries
+from ariel.body_phenotypes.robogen_lite.constructor import construct_mjspec_from_graph
+from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
+    HighProbabilityDecoder,
+    save_graph_as_json,
+)
+from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
+from ariel.simulation.controllers.controller import Controller
+from ariel.simulation.environments import OlympicArena
+from ariel.utils.renderers import single_frame_renderer, video_renderer
+from ariel.utils.runners import simple_runner
+from ariel.utils.tracker import Tracker
+from ariel.utils.video_recorder import VideoRecorder
+
+# Type Aliases
+type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
+
+# --- CONFIGURATION --- #
+SEED = 42
+RNG = np.random.default_rng(SEED)
+CTRL_RANGE = 1.0
+SPAWN_POS = np.array([-0.8, 0.0, 0.1], dtype=np.float32)
+TARGET_POS = np.array([5.0, 0.0, 0.5], dtype=np.float32)
+NUM_OF_MODULES = 30
+
+# --- DATA SETUP ---
+SCRIPT_NAME = __file__.split("/")[-1][:-3]
+CWD = Path.cwd()
+DATA = CWD / "__data__" / SCRIPT_NAME
+DATA.mkdir(exist_ok=True, parents=True)
+
+print(f"[INFO] Data directory: {DATA}")
+
+
+# ============================================================================
+# NEURAL NETWORK CONTROLLER
+# ============================================================================
+class NNController(nn.Module):
+    """Neural network controller with rich sensory input."""
+    
+    def __init__(self, nu: int, hidden_size: int = 32):
+        super().__init__()
+        self.nu = nu
+        # Input: joint_pos + joint_vel + time_features + target_delta
+        self.in_dim = nu + nu + 2 + 2  # qpos + qvel + sin/cos + delta_x/y
+        self.hidden = hidden_size
+        
+        self.fc1 = nn.Linear(self.in_dim, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, self.nu)
+        self.tanh = nn.Tanh()
+    
+    def forward(self, qpos: torch.Tensor, qvel: torch.Tensor, t: float,
+                target_pos: torch.Tensor, current_pos: torch.Tensor):
+        """
+        Args:
+            qpos: Joint positions [nu]
+            qvel: Joint velocities [nu]
+            t: Current time
+            target_pos: Target position [3]
+            current_pos: Current robot position [3]
+        Returns:
+            action: Control signal [nu]
+        """
+        t_tensor = torch.tensor(t, dtype=torch.float32)
+        w = 2 * torch.pi
+        delta = target_pos[:2] - current_pos[:2]
+        
+        time_features = torch.stack([
+            torch.sin(w * t_tensor), 
+            torch.cos(w * t_tensor)
+        ])
+        
+        obs = torch.cat([qpos, qvel, time_features, delta], dim=0)
+        
+        h = self.tanh(self.fc1(obs))
+        h = self.tanh(self.fc2(h))
+        y = self.tanh(self.fc3(h))
+        
+        return CTRL_RANGE * y
+
+
+# ============================================================================
+# BODY GENERATION (NDE)
+# ============================================================================
+def makeBody(num_modules = NUM_OF_MODULES, genotype=None): # type: ignore
+    """Create robot body from genotype using NDE."""
+    nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
+    p_matrices = nde.forward(genotype)
+    hpd = HighProbabilityDecoder(num_modules)
+    robot_graph = hpd.probability_matrices_to_graph(
+        p_matrices[0], p_matrices[1], p_matrices[2]
+    )
+    core = construct_mjspec_from_graph(robot_graph)
+    return core, robot_graph
+
+
+def makeGenotype(num_modules = NUM_OF_MODULES, max_attempts: int = 100): # type: ignore
+    """
+    Generate a valid genotype with bias toward connectivity.
+    Returns: (body_spec, genotype, robot_graph)
+    """
+    for attempt in range(max_attempts): # type: ignore
+        genotype_size = 64
+        
+        # Bias toward valid, connected structures
+        type_p = RNG.random(genotype_size).astype(np.float32) * 0.7 + 0.15
+        conn_p = RNG.random(genotype_size).astype(np.float32) * 0.5 + 0.25
+        rot_p = RNG.random(genotype_size).astype(np.float32)
+        
+        genotype = [type_p, conn_p, rot_p]
+        
+        try:
+            body, graph = makeBody(num_modules, genotype)
+            if is_valid_robot_spec(body.spec):
+                return body, genotype, graph
+        except Exception as e: # type: ignore
+            continue
+    
+    # Fallback: simple structure
+    print("[WARNING] Using fallback genotype")
+    type_p = np.full(64, 0.5, dtype=np.float32)
+    conn_p = np.full(64, 0.6, dtype=np.float32)
+    rot_p = np.full(64, 0.5, dtype=np.float32)
+    genotype = [type_p, conn_p, rot_p]
+    body, graph = makeBody(num_modules, genotype)
+    return body, genotype, graph
+
+
+def is_valid_robot_spec(mj_spec) -> bool: # type: ignore
+    """Check if robot morphology is valid."""
+    try:
+        if mj_spec is None or mj_spec.worldbody is None:
+            return False
+        has_geoms = hasattr(mj_spec.worldbody, "geoms") and len(mj_spec.worldbody.geoms) > 0
+        has_bodies = hasattr(mj_spec.worldbody, "bodies") and len(mj_spec.worldbody.bodies) > 0
+        return has_geoms or has_bodies
+    except Exception:
+        return False
+
+'''def is_learnable(body_spec): # type: ignore
+    """Quick test: can this morphology move at all with random controller?"""
+    try:
+        mj.set_mjcb_control(None)
+        world = OlympicArena()
+        world.spawn(body_spec.spec, spawn_position=SPAWN_POS, 
+                   correct_for_bounding_box=False)
+        model = world.spec.compile()
+        data = mj.MjData(model)
+        
+        # Get initial CENTER OF MASS position (not joint positions!)
+        mj.mj_forward(model, data)  # Compute forward kinematics first
+        initial_pos = data.subtree_com[0][:2].copy()  # XY position of root body
+        
+        # Apply random actions for 2 seconds
+        for _ in range(int(2.0 / model.opt.timestep)):
+            data.ctrl[:] = np.random.uniform(-1, 1, model.nu)
+            mj.mj_step(model, data)
+        
+        # Check XY displacement of center of mass
+        final_pos = data.subtree_com[0][:2]
+        displacement = np.linalg.norm(final_pos - initial_pos)
+        
+        return displacement > 0.1  # Moved at least 10cm in XY plane
+        
+    except Exception as e:
+        print(f"    [Pre-screen] Error testing learnability: {e}")
+        return False'''
+
+# ============================================================================
+# CONTROLLER OPTIMIZATION (CMA-ES)
+# ============================================================================
+def flatten_params(nn: nn.Module) -> np.ndarray:
+    """Flatten all neural network parameters into a single vector."""
+    return np.concatenate([p.detach().cpu().numpy().ravel() for p in nn.parameters()])
+
+
+def unflatten_params(nn: nn.Module, flat: np.ndarray) -> None:
+    """Load flattened parameters back into neural network."""
+    offset = 0
+    with torch.no_grad():
+        for p in nn.parameters():
+            numel = p.numel()
+            p.copy_(torch.tensor(
+                flat[offset:offset+numel].reshape(p.shape), 
+                dtype=p.dtype
+            ))
+            offset += numel
+
+
+def _bind_geom_name(model: mj.MjModel) -> str:
+    """Find valid geom name for tracking."""
+    try:
+        _ = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "core")
+        return "core"
+    except Exception:
+        return mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, 0)
+
+
+def nn_obj_control(nn_obj: NNController, model: mj.MjModel, data: mj.MjData, 
+                   target_pos: np.ndarray, geom_id: int):
+    """Control callback for neural network controller."""
+    current_pos = torch.tensor(data.geom_xpos[geom_id], dtype=torch.float32)
+    qpos = torch.tensor(data.qpos[:nn_obj.nu], dtype=torch.float32)
+    qvel = torch.tensor(data.qvel[:nn_obj.nu], dtype=torch.float32)
+    action = nn_obj(qpos=qpos, qvel=qvel, t=data.time,
+                    target_pos=torch.tensor(target_pos, dtype=torch.float32),
+                    current_pos=current_pos)
+    return action.detach().numpy()
+
+
+def evaluateFitness(model: mj.MjModel,
+                    world: OlympicArena,
+                    nn_obj: NNController,
+                    target_pos: np.ndarray = TARGET_POS,
+                    duration: float = 8.0) -> float:
+    """
+    Evaluate fitness of a robot with given controller.
+    Returns POSITIVE fitness (higher = better).
+    """
+    # Clear any previous callbacks
+    mj.set_mjcb_control(None)
+    data = mj.MjData(model)
+    mj.mj_resetData(model, data)
+    
+    # Setup tracker
+    bind_name = _bind_geom_name(model)
+    geom_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, bind_name)
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind=bind_name)
+    tracker.setup(world.spec, data)
+    
+    # Control callback
+    def _control_cb(m, d): # type: ignore
+        return nn_obj_control(nn_obj, m, d, target_pos, geom_id)
+    
+    ctrl = Controller(controller_callback_function=_control_cb, tracker=tracker)
+    
+    # Install controller
+    mj.set_mjcb_control(ctrl.set_control)
+    
+    # Run simulation
+    try:
+        simple_runner(model, data, duration=duration)
+    except Exception as e:
+        print(f"[WARNING] Simulation failed: {e}")
+        return -1e6
+    
+    # Extract trajectory
+    xpos_dict = tracker.history.get("xpos", {})
+    if not xpos_dict:
+        return -1e6
+    
+    first_key = next(iter(xpos_dict))
+    traj = np.asarray(xpos_dict[first_key])
+    if traj.size == 0 or len(traj) < 2:
+        return -1e6
+    
+    # Compute fitness
+    start, end = traj[0], traj[-1]
+    progress_x = float(end[0] - start[0])  # Forward progress
+    dist_to_target = float(np.linalg.norm(end[:2] - target_pos[:2]))
+    
+    # Reward proximity to target
+    proximity_bonus = max(0.0, 3.0 - dist_to_target)
+    
+    # Small time penalty to encourage speed
+    time_penalty = 0.01 * duration
+    
+    fitness = progress_x + proximity_bonus - time_penalty
+    
+    return fitness
+
+
+def optimize_controller_with_cmaes(nn_obj: NNController,  # type: ignore
+                                   model: mj.MjModel, 
+                                   world: OlympicArena,
+                                   target_pos: np.ndarray, 
+                                   duration: float,
+                                   iterations: int = 12, 
+                                   sigma: float = 0.3, 
+                                   popsize: int = 16) -> tuple: # type: ignore
+    """
+    Optimize neural network controller using CMA-ES.
+    Returns: (best_params, best_fitness)
+    """
+    x0 = flatten_params(nn_obj)
+    
+    def fitness_fn(x): # type: ignore
+        """CMA-ES fitness function (minimizes, so negate)."""
+        unflatten_params(nn_obj, x)
+        f = evaluateFitness(model, world, nn_obj, target_pos=target_pos, duration=duration)
+        return -f  # CMA-ES minimizes
+    
+    # Run CMA-ES
+    es = cma.CMAEvolutionStrategy(
+        x0, 
+        sigma, 
+        {
+            'popsize': popsize, 
+            'maxiter': iterations, 
+            'verb_disp': 0,
+            'verb_log': 0
+        }
+    )
+    
+    es.optimize(fitness_fn)
+    
+    best_x = es.result.xbest
+    best_f = -es.result.fbest  # Convert back to positive fitness
+    
+    # Load best parameters
+    unflatten_params(nn_obj, best_x)
+    
+    return best_x, best_f
+
+
+# ============================================================================
+# INDIVIDUAL CREATION
+# ============================================================================
+def makeIndividual(body_spec, genotype, graph, # type: ignore
+                   target_pos: np.ndarray = TARGET_POS,
+                   duration=8.0, # type: ignore
+                   cmaes_iterations=12, # type: ignore
+                   cmaes_popsize=16): # type: ignore
+    """
+    Create and evaluate an individual robot.
+    Builds world, optimizes controller with CMA-ES, returns complete individual.
+    """
+    # Validate morphology
+    if not is_valid_robot_spec(body_spec.spec):
+        return {
+            "genotype": genotype,
+            "robot_spec": body_spec,
+            "robot_graph": graph,
+            "nn": None,
+            "controller_params": np.array([]),
+            "fitness": -1e6,
+        }
+    
+    # SECOND CHECK: Can it move at all?
+    '''if not is_learnable(body_spec):
+        print("    [Pre-screen] Non-learner detected, skipping CMA-ES")
+        return {
+            "genotype": genotype,
+            "robot_spec": body_spec,
+            "robot_graph": graph,
+            "nn": None,
+            "controller_params": np.array([]),
+            "fitness": -1e6,
+        }'''
+
+
+    # Create fresh simulation context
+    mj.set_mjcb_control(None)
+    world = OlympicArena()
+    
+    try:
+        world.spawn(
+            body_spec.spec, 
+            spawn_position=SPAWN_POS, 
+            correct_for_bounding_box=False
+        )
+        model = world.spec.compile()
+    except Exception as e:
+        print(f"[ERROR] Failed to spawn/compile robot: {e}")
+        return {
+            "genotype": genotype,
+            "robot_spec": body_spec,
+            "robot_graph": graph,
+            "nn": None,
+            "controller_params": np.array([]),
+            "fitness": -1e6,
+        }
+    
+    # Create neural network controller
+    nn_obj = NNController(nu=model.nu, hidden_size=32)
+    
+    # Optimize with CMA-ES
+    print(f"    [CMA-ES] Starting optimization (nu={model.nu})...")
+    best_params, best_fitness = optimize_controller_with_cmaes(
+        nn_obj, model, world, 
+        target_pos=target_pos, 
+        duration=duration,
+        iterations=cmaes_iterations, 
+        sigma=0.3, 
+        popsize=cmaes_popsize
+    )
+    print(f"    [CMA-ES] Completed. Fitness: {best_fitness:.3f}")
+    
+    return {
+        "genotype": genotype,
+        "robot_spec": body_spec,
+        "robot_graph": graph,
+        "nn": nn_obj,
+        "controller_params": best_params,
+        "fitness": best_fitness,
+    }
+
+def get_duration(best_fitness): # type: ignore
+    """Adaptive duration based on best fitness."""
+    if best_fitness < 1.0:
+        return 8.0   # Early stages: 8 seconds
+    elif best_fitness < 3.0:
+        return 12.0  # Making progress: give more time
+    elif best_fitness < 5.0:
+        return 16.0  # Near target: even more time
+    else:
+        return 20.0  # Past target: maximum time to go further
+
+# ============================================================================
+# DIFFERENTIAL EVOLUTION (BODY EVOLUTION)
+# ============================================================================
+def mutation_DE(a, b, c, F): # type: ignore
+    """Differential mutation: mutant = a + F * (b - c)."""
+    mutant_genotype = []
+    for vec_idx in range(3):
+        diff = b[vec_idx] - c[vec_idx]
+        mutant_vec = a[vec_idx] + F * diff
+        mutant_vec = np.clip(mutant_vec, 0.0, 1.0)  # Keep in valid range
+        mutant_genotype.append(mutant_vec)
+    return mutant_genotype
+
+
+def crossover_DE(parent, mutant, CR, vector_size=3, gene_size=64): # type: ignore
+    """Binomial crossover between parent and mutant."""
+    rng = np.random.default_rng()
+    crossover_genotype = []
+    
+    for vec_idx in range(vector_size):
+        mask = rng.random(gene_size) < CR
+        # Ensure at least one gene from mutant
+        mask[rng.integers(0, gene_size)] = True
+        trial_vec = np.where(mask, mutant[vec_idx], parent[vec_idx])
+        crossover_genotype.append(trial_vec)
+    
+    return crossover_genotype
+
+
+def train_body_de(out_csv,  # type: ignore
+                  generations=30,  # type: ignore
+                  pop_size=15,  # type: ignore
+                  num_modules=NUM_OF_MODULES, # type: ignore
+                  F=0.7,  # type: ignore
+                  CR=0.9, # type: ignore
+                  target_pos: np.ndarray = TARGET_POS,
+                  duration=8.0, # type: ignore
+                  cmaes_iterations=12, # type: ignore
+                  cmaes_popsize=16): # type: ignore
+    """
+    Differential Evolution for morphology evolution.
+    Each individual's controller is optimized with CMA-ES.
+    """
+    rng = np.random.default_rng(SEED)
+    
+    print("\n" + "="*70)
+    print("DIFFERENTIAL EVOLUTION - BODY + BRAIN OPTIMIZATION")
+    print("="*70)
+    print(f"Population size: {pop_size}")
+    print(f"Generations: {generations}")
+    print(f"Num modules: {num_modules}")
+    print(f"F: {F}, CR: {CR}")
+    print(f"CMA-ES iterations: {cmaes_iterations}, popsize: {cmaes_popsize}")
+    print("="*70 + "\n")
+    
+    # ========================================================================
+    # INITIALIZATION
+    # ========================================================================
+    print("[INIT] Generating initial population...")
+    population = []  # List of genotypes
+    individuals = []  # List of full individual dicts
+    fitnesses = []
+    
+    for i in range(pop_size):
+        print(f"\n[INIT] Individual {i+1}/{pop_size}")
+        
+        body, genotype, graph = makeGenotype(num_modules)
+        
+        if not is_valid_robot_spec(body.spec):
+            print(f"  Invalid morphology, assigning poor fitness")
+            population.append(genotype)
+            individuals.append(None)
+            fitnesses.append(-1e6)
+            continue
+        
+        # Evaluate with CMA-ES optimized controller
+        indiv = makeIndividual(
+            body, genotype, graph,
+            target_pos=target_pos, 
+            duration=duration,
+            cmaes_iterations=cmaes_iterations,
+            cmaes_popsize=cmaes_popsize
+        )
+        
+        population.append(genotype)
+        individuals.append(indiv)
+        fitnesses.append(indiv["fitness"])
+        
+        print(f"  ✓ Fitness: {indiv['fitness']:.3f}")
+    
+    fitnesses = np.array(fitnesses)
+
+    # --- Stagnation tracking and elitism ---
+    STAGNATION_K = 8  # kill/reseed after N stagnant generations 
+    stagnation = np.zeros(pop_size, dtype=int)
+    best_so_far = fitnesses.copy()
+    ELITES = max(2, pop_size // 3)  # Protect top 33% 
+    
+    # Track best
+    best_idx = int(np.argmax(fitnesses))
+    best_individual = individuals[best_idx]
+    best_fitness = float(fitnesses[best_idx])
+    
+    print(f"\n[INIT] Initialization complete!")
+    print(f"  Best fitness: {best_fitness:.3f}")
+    print(f"  Mean fitness: {np.mean(fitnesses):.3f}")
+    print(f"  Median fitness: {np.median(fitnesses):.3f}")
+    
+    # ========================================================================
+    # CSV LOGGING
+    # ========================================================================
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
+        writer.writerow([0, best_fitness, np.mean(fitnesses), np.median(fitnesses)])
+        
+        # ====================================================================
+        # EVOLUTION LOOP
+        # ====================================================================
+        for g in range(generations):
+            print("\n" + "="*70)
+            print(f"GENERATION {g+1}/{generations}")
+            print("="*70)
+            
+            for i in range(pop_size):
+                # Skip terrible individuals
+                if fitnesses[i] < -1e5:
+                    print(f"[Gen {g+1}] Individual {i}: Skipping (terrible fitness)")
+                    continue
+                
+                print(f"\n[Gen {g+1}] Individual {i+1}/{pop_size}")
+                
+                # Select 3 different individuals for mutation
+                candidates = [idx for idx in range(pop_size) if idx != i]
+                a, b, c = rng.choice(candidates, size=3, replace=False)
+                
+                # Mutation
+                mutant_genotype = mutation_DE(
+                    population[a], 
+                    population[b], 
+                    population[c], 
+                    F
+                )
+                
+                # Crossover
+                trial_genotype = crossover_DE(
+                    population[i], 
+                    mutant_genotype, 
+                    CR, 
+                    vector_size=3, 
+                    gene_size=64
+                )
+                
+                # Evaluate trial
+                trial_body, trial_graph = makeBody(num_modules, trial_genotype)
+
+                if not is_valid_robot_spec(trial_body.spec):
+                    print(f"  Trial invalid, keeping parent (fitness: {fitnesses[i]:.3f})")
+                    continue
+
+                # Adaptive CMA-ES budget: spend more on promising parents
+                #finite_mask = np.isfinite(fitnesses)
+                #med_fit = float(np.median(fitnesses[finite_mask])) if finite_mask.any() else -1e6
+                #its = cmaes_iterations if fitnesses[i] >= med_fit else max(6, cmaes_iterations // 2)
+                its = cmaes_iterations
+
+                current_duration = get_duration(best_fitness)
+
+                trial_indiv = makeIndividual(
+                    trial_body, trial_genotype, trial_graph,
+                    target_pos=target_pos,
+                    duration=current_duration,
+                    cmaes_iterations=its,
+                    cmaes_popsize=cmaes_popsize
+                )
+
+                trial_fitness = trial_indiv["fitness"]
+                
+                # Selection: replace if better
+                old_fit = fitnesses[i]
+                if trial_fitness > old_fit + 1e-6:
+                    population[i] = trial_genotype
+                    individuals[i] = trial_indiv
+                    fitnesses[i] = trial_fitness
+                    stagnation[i] = 0
+                    best_so_far[i] = trial_fitness
+                    print(f"  IMPROVED: {trial_fitness:.3f} (was {old_fit:.3f})")
+                else:
+                    stagnation[i] += 1
+                    print(f"  No improvement: {trial_fitness:.3f} <= {old_fit:.3f} (stagnation {stagnation[i]})")
+            
+            # --- Kill/reseed zombies (non-elites only) ---
+            elite_idx = np.argsort(-fitnesses)[:ELITES]
+            non_elites = [j for j in range(pop_size) if j not in elite_idx]
+
+            for j in non_elites:
+                if stagnation[j] >= STAGNATION_K or fitnesses[j] < -1e5:
+                    body, new_g, graph = makeGenotype(num_modules)
+                    population[j] = new_g
+                    current_duration = get_duration(best_fitness)
+                    # Re-evaluate with full CMA-ES budget
+                    indiv = makeIndividual(
+                        body, new_g, graph,
+                        target_pos=target_pos,
+                        duration=current_duration,
+                        cmaes_iterations=cmaes_iterations,
+                        cmaes_popsize=cmaes_popsize
+                    )
+                    individuals[j] = indiv
+                    fitnesses[j] = indiv["fitness"]
+                    best_so_far[j] = fitnesses[j]
+                    stagnation[j] = 0
+                    print(f"  [refresh] Reinitialized slot {j} → fitness {fitnesses[j]:.3f}")
+
+            # Update best
+            gen_best_idx = int(np.argmax(fitnesses))
+            gen_best = float(fitnesses[gen_best_idx])
+            
+            if gen_best > best_fitness:
+                best_fitness = gen_best
+                best_individual = individuals[gen_best_idx]
+                print(f"\n  NEW BEST FITNESS: {best_fitness:.3f}")
+            
+            # Log statistics
+            gen_mean = float(np.mean(fitnesses))
+            gen_median = float(np.median(fitnesses))
+            writer.writerow([g+1, gen_best, gen_mean, gen_median])
+            f.flush()
+            
+            print(f"\n[Gen {g+1}] Summary:")
+            print(f"  Best:   {gen_best:.3f}")
+            print(f"  Mean:   {gen_mean:.3f}")
+            print(f"  Median: {gen_median:.3f}")
+    
+    print("\n" + "="*70)
+    print("EVOLUTION COMPLETE")
+    print("="*70)
+    print(f"Final best fitness: {best_fitness:.3f}")
+    print("="*70 + "\n")
+    
+    return best_individual, best_fitness
+
+
+# ============================================================================
+# BASELINE EXPERIMENT
+# ============================================================================
+def baseline_experiment(out_csv,  # type: ignore
+                       pop_size=20,  # type: ignore
+                       num_modules=NUM_OF_MODULES,  # type: ignore
+                       duration=8.0, # type: ignore
+                       target_pos=np.array([5.0, 0.0, 0.5], dtype=np.float32)): # type: ignore
+    """
+    Baseline: Random morphologies with RANDOM (untrained) controllers.
+    """
+    print("\n" + "="*70)
+    print("BASELINE EXPERIMENT - Random Controllers")
+    print("="*70)
+    
+    best_fitness = -1e6
+    best_individual = None
+    all_fitnesses = []
+    
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["individual", "fitness"])
+        
+        for i in range(pop_size):
+            print(f"\n[Baseline] Individual {i+1}/{pop_size}")
+            
+            body, genotype, graph = makeGenotype(num_modules)
+            
+            if not is_valid_robot_spec(body.spec):
+                writer.writerow([i, -1e6])
+                all_fitnesses.append(-1e6)
+                print(f"  Invalid morphology")
+                continue
+            
+            # Create world and model
+            mj.set_mjcb_control(None)
+            world = OlympicArena()
+            
+            try:
+                world.spawn(body.spec, spawn_position=SPAWN_POS, 
+                           correct_for_bounding_box=False)
+                model = world.spec.compile()
+            except Exception as e:
+                print(f"  Spawn/compile failed: {e}")
+                writer.writerow([i, -1e6])
+                all_fitnesses.append(-1e6)
+                continue
+            
+            # Random controller (NO CMA-ES)
+            nn_obj = NNController(nu=model.nu, hidden_size=32)
+            
+            # Evaluate with random weights
+            fitness = evaluateFitness(model, world, nn_obj, 
+                                     target_pos=target_pos, duration=duration)
+            
+            writer.writerow([i, fitness])
+            all_fitnesses.append(fitness)
+            
+            print(f"  Fitness: {fitness:.3f}")
+            
+            if fitness > best_fitness:
+                best_fitness = fitness
+                best_individual = {
+                    "genotype": genotype,
+                    "robot_spec": body,
+                    "robot_graph": graph,
+                    "nn": nn_obj,
+                    "fitness": fitness
+                }
+    
+    print(f"\n[Baseline] Complete!")
+    print(f"  Best fitness: {best_fitness:.3f}")
+    print(f"  Mean fitness: {np.mean(all_fitnesses):.3f}")
+    print(f"  Median fitness: {np.median(all_fitnesses):.3f}")
+    
+    return best_individual, best_fitness
+
+
+# ============================================================================
+# VISUALIZATION
+# ============================================================================
+def visualize_best_robot(individual_dict,  # type: ignore
+                        target_pos: np.ndarray = TARGET_POS,
+                        duration=8.0, # type: ignore
+                        mode: ViewerTypes = "launcher"):
+    """
+    Visualize the best robot with its optimized controller.
+    """
+    if individual_dict is None or individual_dict["nn"] is None:
+        print("[ERROR] Cannot visualize: invalid individual")
+        return
+    
+    print(f"\n[Visualize] Loading best robot (fitness: {individual_dict['fitness']:.3f})")
+    
+    # Setup world
+    mj.set_mjcb_control(None)
+    world = OlympicArena()
+    world.spawn(
+        individual_dict["robot_spec"].spec,
+        spawn_position=SPAWN_POS,
+        correct_for_bounding_box=False
+    )
+    model = world.spec.compile()
+    data = mj.MjData(model)
+    
+    # Setup controller
+    nn_obj = individual_dict["nn"]
+    
+    bind_name = _bind_geom_name(model)
+    geom_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, bind_name)
+
+    def cb(m, d): # type: ignore
+        return nn_obj_control(nn_obj, m, d, target_pos, geom_id)
+
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind=bind_name)
+    tracker.setup(world.spec, data)
+    ctrl = Controller(controller_callback_function=cb, tracker=tracker)
+    
+    mj.set_mjcb_control(ctrl.set_control)
+    
+    # Visualize
+    if mode == "launcher":
+        print("[Visualize] Launching interactive viewer...")
+        viewer.launch(model=model, data=data)
+    elif mode == "video":
+        print(f"[Visualize] Recording video to {DATA / 'videos'}...")
+        video_recorder = VideoRecorder(output_folder=str(DATA / "videos"))
+        video_renderer(model, data, duration=duration, video_recorder=video_recorder)
+        print("[Visualize] Video saved!")
+    elif mode == "simple":
+        print("[Visualize] Running simulation...")
+        simple_runner(model, data, duration=duration)
+    elif mode == "frame":
+        print(f"[Visualize] Saving frame to {DATA / 'robot.png'}...")
+        single_frame_renderer(model, data, save=True, save_path=str(DATA / "robot.png"))
+        print("[Visualize] Frame saved!")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main() -> None:
+    """Main entry point for robot evolution."""
+    
+    # ========================================================================
+    # CONFIGURATION
+    # ========================================================================
+    MODE = "evolve"  # Options: "evolve", "baseline", "visualize"
+    
+    # Evolution parameters
+    GENERATIONS = 30
+    POP_SIZE = 15
+    NUM_MODULES = 30
+    F = 0.7
+    CR = 0.9
+    
+    # CMA-ES parameters
+    CMAES_ITERATIONS = 12
+    CMAES_POPSIZE = 16
+    
+    # Simulation parameters
+    DURATION = 8.0
+    
+    # Visualization
+    VIEW_MODE: ViewerTypes = "launcher"  # "launcher", "video", "simple", "frame"
+    
+    # ========================================================================
+    # EXECUTION
+    # ========================================================================
+    
+    if MODE == "baseline": # type: ignore
+        print("\n🔬 RUNNING BASELINE EXPERIMENT")
+        best_indiv, best_fit = baseline_experiment(
+            out_csv=str(DATA / "baseline_results.csv"),
+            pop_size=20,
+            num_modules=NUM_MODULES,
+            duration=DURATION,
+            target_pos=TARGET_POS
+        )
+        print(f"\n Baseline complete! Best fitness: {best_fit:.3f}")
+        
+        # Save baseline result
+        if best_indiv is not None:
+            np.save(DATA / "baseline_best_fitness.npy", best_fit)
+    
+    elif MODE == "evolve":
+        print("\n RUNNING EVOLUTIONARY EXPERIMENT")
+        best_individual, best_fitness = train_body_de(
+            out_csv=str(DATA / "evolution_results.csv"),
+            generations=GENERATIONS,
+            pop_size=POP_SIZE,
+            num_modules=NUM_MODULES,
+            F=F,
+            CR=CR,
+            target_pos=TARGET_POS,
+            duration=DURATION,
+            cmaes_iterations=CMAES_ITERATIONS,
+            cmaes_popsize=CMAES_POPSIZE
+        )
+        
+        print(f"\n Evolution complete! Best fitness: {best_fitness:.3f}")
+        
+        # ====================================================================
+        # SAVE BEST ROBOT FOR SUBMISSION
+        # ====================================================================
+        if best_individual is not None and best_individual["robot_graph"] is not None:
+            # Save robot morphology as JSON
+            robot_json_path = DATA / "best_robot.json"
+            save_graph_as_json(
+                best_individual["robot_graph"],
+                str(robot_json_path)
+            )
+            print(f"\n Saved robot morphology: {robot_json_path}")
+            
+            # Save controller parameters
+            controller_path = DATA / "best_controller_params.npy"
+            np.save(controller_path, best_individual["controller_params"])
+            print(f" Saved controller params: {controller_path}")
+            
+            # Save fitness for reference
+            fitness_path = DATA / "best_fitness.npy"
+            np.save(fitness_path, best_fitness)
+            print(f" Saved fitness: {fitness_path}")
+            
+            # Save complete individual dict (for visualization)
+            individual_path = DATA / "best_individual.pkl"
+            import pickle
+            with open(individual_path, "wb") as f:
+                pickle.dump(best_individual, f)
+            print(f" Saved complete individual: {individual_path}")
+            
+            print("\n" + "="*70)
+            print("SUBMISSION FILES READY:")
+            print(f"  1. Robot JSON:  {robot_json_path}")
+            print(f"  2. Controller:  {controller_path}")
+            print("="*70)
+            
+            # Visualize best robot
+            print(f"\n🎬 Visualizing best robot (mode: {VIEW_MODE})...")
+            visualize_best_robot(
+                best_individual,
+                target_pos=TARGET_POS,
+                duration=DURATION,
+                mode=VIEW_MODE
+            )
+        else:
+            print("\n No valid robot found!")
+    
+    elif MODE == "visualize":
+        print("\n🎬 LOADING AND VISUALIZING SAVED ROBOT")
+        
+        # Load saved individual
+        individual_path = DATA / "best_individual.pkl"
+        if not individual_path.exists():
+            print(f" No saved robot found at {individual_path}")
+            print("   Run with MODE='evolve' first!")
+            return
+        
+        import pickle
+        with open(individual_path, "rb") as f:
+            best_individual = pickle.load(f)
+        
+        print(f" Loaded robot with fitness: {best_individual['fitness']:.3f}")
+        
+        visualize_best_robot(
+            best_individual,
+            target_pos=TARGET_POS,
+            duration=DURATION,
+            mode=VIEW_MODE
+        )
+    
+    else:
+        print(f" Unknown MODE: {MODE}")
+        print("  Available modes: 'evolve', 'baseline', 'visualize'")
+
+
+if __name__ == "__main__":
+    main()
