@@ -60,8 +60,47 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 print("helololololololo")
 
+SEED = 42
+RNG = np.random.default_rng(SEED)
 
+# --- DATA SETUP ---
+SCRIPT_NAME = __file__.split("/")[-1][:-3]
+CWD = Path.cwd()
+DATA = CWD / "__data__" / SCRIPT_NAME
+DATA.mkdir(exist_ok=True)
 
+CTRL_RANGE = 1.0
+BODY_COLLECTION = {}
+# ----------------------------
+# Neural Network Controller
+# ----------------------------
+class NNController(nn.Module):
+    def __init__(self, nu: int, hidden_size: int = 8):
+        super().__init__()
+        self.nu = nu
+        self.in_dim = nu + 4   # prev_ctrl + sin/cos + delta_x, delta_y
+        self.hidden = hidden_size
+        self.out_dim = nu
+
+        self.fc1 = nn.Linear(self.in_dim, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, self.out_dim)
+        self.tanh = nn.Tanh()
+
+    def forward(self, prev_ctrl: torch.Tensor, t: float, target_pos: torch.Tensor, current_pos: torch.Tensor):
+        t_tensor = torch.tensor(t, dtype=torch.float32)
+        w = 2 * torch.pi
+        delta = target_pos[:2] - current_pos[:2]
+        
+        # Use t_tensor here
+        time_features = torch.stack([torch.sin(w * t_tensor), torch.cos(w * t_tensor)])
+        
+        obs = torch.cat([prev_ctrl, time_features, delta], dim=0)
+        h = self.tanh(self.fc1(obs))
+        h = self.tanh(self.fc2(h))
+        y = self.tanh(self.fc3(h))
+        return CTRL_RANGE * y
+    
 
 def makeBody(num_modules: int = 20, genotype=None):
     nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
@@ -89,6 +128,8 @@ def makeGenotype(num_modules: int = 20):
 
 
 
+def makeNeuralNetwork(nu: int, hidden_size: int = 8):
+    return NNController(nu=nu, hidden_size=hidden_size)
 
 def makeIndividual(body,genotype):
     #Create a body
@@ -203,8 +244,8 @@ def train_mlp_pso(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=N
             gen_median = float(np.median(pbest_scores))
             writer.writerow([g, gen_best, gen_mean, gen_median])
 
-            if (g + 1) % max(1, generations // 10) == 0:
-                print(f"[mlp_pso seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
+            #if (g + 1) % max(1, generations // 10) == 0:
+            #    print(f"[mlp_pso seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
 
     return best_candidate, gbest_score
 
@@ -291,12 +332,13 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
                 best_candidate = pop[int(np.argmax(fits))].copy()
 
             #Print every after every 10th generation
-            if (g + 1) % max(1, generations // 10) == 0:
-                print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
+            #if (g + 1) % max(1, generations // 10) == 0:
+                #print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
 
     return best_candidate, best_fit
 
 
+#    #train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=10, pop_size=10, seed=SEED)
 
 
 
@@ -307,146 +349,43 @@ def TrainDummyNet(nn_obj: NNController):
     return None, fitness
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def Testruntime():
+    print("Starting Test time...")
+    for i in range(50,500,50):
+        print("Generations:", i)
+        start_de = time.time()
+        best_candidate_DE, best_fit_DE = train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=i, pop_size=10, seed=SEED)
+        end_de = time.time()
+        start_pso = time.time()
+        best_candidate_PSO, best_fit_PSO = train_mlp_pso(out_csv=str(DATA / "mlp_pso3_results.csv"), generations=i, pop_size=10, seed=SEED)
+        end_pso = time.time()
+        print("Best DE candidate fitness:", best_fit_DE)
+        print("Best PSO candidate fitness:", best_fit_PSO)
+        print("DE Time:", end_de - start_de)
+        print("PSO Time:", end_pso - start_pso)
+            
+
+
+
+
+def main():
+    Testruntime()
+    print("Starting evolutionary algorithm...")
+    start_de = time.time()
+    best_candidate_DE, best_fit_DE = train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=10, pop_size=10, seed=SEED)
+    end_de = time.time()
+    start_pso = time.time()
+    best_candidate_PSO, best_fit_PSO = train_mlp_pso(out_csv=str(DATA / "mlp_pso3_results.csv"), generations=10, pop_size=10, seed=SEED)
+    end_pso = time.time()
+    print("Best DE candidate fitness:", best_fit_DE)
+    print("Best PSO candidate fitness:", best_fit_PSO)
+    print("DE Time:", end_de - start_de)
+    print("PSO Time:", end_pso - start_pso)
+
+
+if __name__ == "__main__":
+    main()
+"""
 
 # Dummy fitness function that returns a random score for each particle
 def dummy_fitness_function(x):
@@ -547,3 +486,4 @@ def main():
     
 if __name__ == "__main__":
     main()
+"""
