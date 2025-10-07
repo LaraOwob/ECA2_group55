@@ -12,6 +12,7 @@ import numpy.typing as npt
 from mujoco import viewer
 from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 from functools import partial
+from deap import base, creator, tools
 
 # Local libraries
 from ariel.body_phenotypes.robogen_lite.constructor import (
@@ -30,6 +31,7 @@ from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
+import random as pyrand
 
 # Type Checking
 if TYPE_CHECKING:
@@ -41,7 +43,8 @@ type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 # --- RANDOM GENERATOR SETUP --- #
 SEED = 42
 RNG = np.random.default_rng(SEED)
-TARGET_POS = np.array([1.9, 0.3, 0.1])
+TARGET_POS = np.array([0, -2, 0.1])
+SPAWN=[0, 0, 0.1]
 
 # --- DATA SETUP ---
 SCRIPT_NAME = __file__.split("/")[-1][:-3]
@@ -49,6 +52,7 @@ CWD = Path.cwd()
 DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(exist_ok=True)
 TOLERANCE = 0.1 
+CTRL_MAX = np.pi / 2  # match controller clipping
 
 
 def show_xpos_history(history: list[float]) -> None:
@@ -164,20 +168,21 @@ class MLPController:
         return W1, b1, W2, b2
     
     #Applies forward pass and returns MLP output
-    def forward(self, prev_ctrl: np.ndarray, t: float, target_pos: np.ndarray, current_pos: np.ndarray) -> np.ndarray:
+   
+    def forward(self, prev_ctrl, t, target_pos, current_pos):
         w = 2*np.pi*self.freq_hz
-        #includes the distance to target as input
         delta = target_pos[:2] - current_pos[:2] 
         obs = np.concatenate([prev_ctrl, [np.sin(w*t), np.cos(w*t)], delta], dtype=np.float64)
         W1, b1, W2, b2 = self._unpack()
         h = np.tanh(obs @ W1 + b1)
         y = np.tanh(h @ W2 + b2)
-        return np.pi * y
+        return np.pi * y  
     
 
 def mlp_forward(model, data, network, core_bind, *args, **kwargs):
     prev_ctrl = data.ctrl.copy()
-    current_pos = data.xpos[core_bind.id] # root position
+    current_pos = data.xpos[core_bind.id]
+
     t = data.time               # use actual simulation time
     return network.forward(prev_ctrl, t, TARGET_POS, current_pos)
 
@@ -226,7 +231,7 @@ def create_tracker():
     return tracker
 
 
-def evaluate_fitness(candidate, model, data, ctrl, network, core_bind, duration=30.0):
+def evaluate_fitness(candidate, model, data, ctrl, network, core_bind, duration=30.0, alpha = 0.2):
     
     """
     Evaluate MLP controller fitness using the simulation runner and Controller class.
@@ -263,6 +268,7 @@ def evaluate_fitness(candidate, model, data, ctrl, network, core_bind, duration=
     
 
     dist = np.linalg.norm(data.xpos[core_bind.id] - TARGET_POS)
+   
     
     # Fitness: inverse of distance (closer is better)
     fitness = 1.0 / (dist + 1e-6)  # add epsilon to avoid div by zero
@@ -271,121 +277,112 @@ def evaluate_fitness(candidate, model, data, ctrl, network, core_bind, duration=
     return fitness
 
 
-def evaluate_fitness2(candidate, model, data, ctrl, network, core_bind, duration=15, alpha=0.2):
+
+
+def evaluate_fitness2(candidate, model, data, ctrl, network, core_bind, duration=15, alpha=0.1):
+    """
+    Simple fitness: encourages fast movement toward TARGET_POS on rugged terrain.
+
+    Fitness increases if the robot moves closer to the target quickly.
+    """
+    beta = 0.05
+    alpha = 0.1
     network.set_params(candidate)
 
     # Reset simulation
     mj.mj_resetData(model, data)
 
     # Assign network forward as controller callback
-    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind = core_bind)
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind=core_bind)
     mj.set_mjcb_control(ctrl.set_control)
 
-    # Initialize tracking
-    nu = model.nu
-    prev_ctrl = np.zeros(nu, dtype=np.float64)
-    energy_acc = 0.0
-    smooth_acc = 0.0
-    reached = False
-    time_to_target = duration
+    start_pos = data.xpos[0].copy()
+    dt = 1.0 / network.freq_hz
+    steps = int(duration / dt)
+    prev_ctrl = np.zeros(network.nu)
+    total_control_effort = 0.0
 
-    # Wrap controller to log energy and smoothness during simple_runner
-    original_forward = network.forward
+    # --- Run simulation ---
+    for step in range(steps):
+        t = step * dt
+        current_pos = data.xpos[0].copy()
 
-     # Wrap network.forward to log energy, smoothness, and reaching
-    def logging_forward(model_inner, data_inner, *args, **kwargs):
-        nonlocal prev_ctrl, energy_acc, smooth_acc, reached, time_to_target
+        # Forward pass (target given to NN)
+        u = network.forward(prev_ctrl, t, TARGET_POS, current_pos)
+        prev_ctrl = u.copy()
+        total_control_effort += np.sum(np.abs(u))
 
-        # Current position
-        current_pos = data_inner.xpos[core_bind.id].copy()
-        t = data_inner.time
+        data.ctrl[:] = u
 
-        # Compute control
-        ctrl_out = network.forward(prev_ctrl, t, TARGET_POS, current_pos)
-        ctrl_val = (1 - alpha) * prev_ctrl + alpha * ctrl_out
+        # Step simulation
+        mj.mj_step(model, data)
 
-        # Update accumulators
-        energy_acc += float(np.mean(np.abs(ctrl_val)))
-        smooth_acc += float(np.mean(np.abs(ctrl_val - prev_ctrl)))
-        prev_ctrl[:] = ctrl_val
+    # --- Compute fitness ---
+    end_pos = data.xpos[0].copy()
+    move_vec = end_pos - start_pos
+    target_vec = TARGET_POS[:2] - start_pos[:2]
+    target_dist = np.linalg.norm(target_vec)
 
-        # Check if reached
-        dist = np.linalg.norm(current_pos[:2] - TARGET_POS[:2])
-        if (not reached) and dist < TOLERANCE:
-            reached = True
-            time_to_target = t
-
-        return ctrl_val
-
-
-    # Replace network forward temporarily
-    ctrl.controller_callback_function = logging_forward
-
-    # Run simulation
-    simple_runner(model, data, duration=duration)
-
-    # Compute final distance
-    final_dist = np.linalg.norm(data.xpos[core_bind.id, :2] - TARGET_POS[:2])
-    start_pos = data.xpos[0, :].copy()  # full 3D position of the root/body
-    initial_dist = np.linalg.norm(start_pos[:2] - TARGET_POS[:2]) 
-    # Fitness: higher if reached quickly, smoother, and energy-efficient
-    initial_dist = np.linalg.norm(start_pos[:2] - TARGET_POS[:2])
-    final_dist = np.linalg.norm(data.xpos[0, :2] - TARGET_POS[:2])
-    progress = (initial_dist - final_dist) / (initial_dist + 1e-6)  # 0 to 1 scale
-
-    max_reward = 1.0
-    if reached:
-        progress = 1.0  # reached
-        time_factor = (duration - time_to_target) / duration  # 0-1
-        fitness = max_reward * (0.8 * progress + 0.2 * time_factor) - 0.05 * energy_acc - 0.05 * smooth_acc
+    if target_dist < 1e-6:
+        target_dir = np.array([1.0, 0.0])
     else:
-        progress = (initial_dist - final_dist) / (initial_dist + 1e-6)  # 0-1
-        fitness = max_reward * progress - 0.05 * energy_acc - 0.05 * smooth_acc
+        target_dir = target_vec / target_dist
+
+    # Progress along target
+    progress = np.dot(move_vec[:2], target_dir)
+
+    # Side drift (perpendicular component)
+    side_drift = np.linalg.norm(move_vec[:2] - progress * target_dir)
+
+    # Combine into fitness
+    fitness = progress - alpha * side_drift - beta * total_control_effort
 
     return fitness
 
 
-def evaluate_fitness3(candidate, model, data, ctrl, network, core_bind, duration=15, alpha=0.2):
+def evaluate_fitness3(theta, model, data, ctrl, network, core_bind, T, alpha = 0.2):
     """
-    Evaluate MLP controller fitness using the simulation runner and Controller class.
-    
-    Parameters
-    ----------
-    model : mujoco.MjModel
-    data : mujoco.MjData
-    ctrl : Controller
-        Controller instance to use for simulation.
-    network : MLPController
-        MLP network providing forward() method.
-    duration : float
-        Simulation duration in seconds.
-    
-    Returns
-    -------
-    float
-        Fitness (higher is better).
+    Simple, stable fitness: reward forward walking straight toward +Y.
+    Works very well on flat terrain.
     """
+    # Set NN parameters
+    network.set_params(theta)
+
     # Reset simulation
     mj.mj_resetData(model, data)
-    
-    # Assign network forward as controller callback
-    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind = core_bind)
-    
-    # Set controller in MuJoCo
+
+    # Assign controller
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind=core_bind)
     mj.set_mjcb_control(ctrl.set_control)
-    
-    # Run simulation
-    simple_runner(model, data, duration=duration)
-    
-    # Compute final distance to target (2D)
-    delta_to_target = TARGET_POS[:2] - data.xpos[core_bind.id][:2]
-    distance = np.linalg.norm(delta_to_target)
-    
-    # Fitness: inverse of distance (closer is better)
-    fitness = 1.0 / (distance + 1e-6)  # add epsilon to avoid div by zero
-    
-   
+
+    # Record start position
+    start_pos = data.xpos[core_bind.id].copy()
+
+    dt = 1.0 / network.freq_hz
+
+    simple_runner(model, data, duration=T)
+
+     # Compute displacement
+    end_pos = data.xpos[core_bind.id].copy()
+    move_vec = end_pos - start_pos
+
+    # Forward (Y-axis) progress
+    forward_progress = -move_vec[1]
+
+    # Side drift (X-axis)
+    side_drift = abs(move_vec[0])
+
+    # Reward forward motion, penalize sideways drift
+    fitness = forward_progress - 0.1 * side_drift
+
     return fitness
+
+
+
+
+
+
+
 
 
 
@@ -412,43 +409,8 @@ def train_mlp_cma(
     world=None,
 ):
     """
-    CMA-ES optimization for MLP controller parameters.
-
-    Parameters
-    ----------
-    generations : int
-        Number of generations to run CMA-ES.
-    pop_size : int or None
-        Population size (lambda). Default = CMA-ES default.
-    T : float
-        Simulation duration.
-    model, data : mujoco.MjModel, mujoco.MjData
-        MuJoCo model and data.
-    core_bind : object
-        Object to track (e.g. body or geom reference).
-    hidden : int
-        Hidden layer size of MLP.
-    freq_hz : float
-        Controller frequency.
-    sigma : float
-        Initial standard deviation for CMA-ES.
-    init_scale : float
-        Initial parameter scaling.
-    tracker : Tracker or None
-        Optional tracking object.
-    alpha : float
-        Smoothing coefficient.
-    world : object
-        World/environment descriptor.
-
-    Returns
-    -------
-    best_params : np.ndarray
-        Best set of weights found.
-    best_fitness : float
-        Fitness value of best candidate.
+    CMA-ES optimization for MLP controller parameters (maximizing fitness).
     """
-
     rng = np.random.default_rng(seed)
     np.random.seed(seed)
 
@@ -464,7 +426,7 @@ def train_mlp_cma(
 
     # Controller wrapper
     ctrl = Controller(
-        controller_callback_function=partial(mlp_forward, network=network, core_bind = core_bind),
+        controller_callback_function=partial(mlp_forward, network=network, core_bind=core_bind),
         tracker=tracker
     )
 
@@ -477,24 +439,28 @@ def train_mlp_cma(
     })
 
     best_candidate = None
-    best_fit = -np.inf
+    best_fit = -np.inf  # we want to maximize fitness
 
     # Evolution loop
     for gen in range(generations):
         candidates = es.ask()
         fitnesses = []
 
+        # Evaluate all candidates
         for cand in candidates:
-            fit = evaluate_fitness(cand, model, data, ctrl, network, T, core_bind, alpha = 0.2)
-            fitnesses.append(-fit)  # CMA minimizes, so negate
+            fit = evaluate_fitness3(cand, model, data, ctrl, network, core_bind, T, alpha=alpha)
+            # Negate because CMA minimizes by default
+            fitnesses.append(-fit)
 
         es.tell(candidates, fitnesses)
         es.disp()
 
-        # CMA stores best solution internally
-        gen_best_fit = -min(fitnesses)
-        gen_best_candidate = candidates[int(np.argmin(fitnesses))]
+        # Correctly identify the best candidate in this generation
+        best_idx = int(np.argmin(fitnesses))  # min(-fitness) = max(fitness)
+        gen_best_fit = -fitnesses[best_idx]   # revert negation
+        gen_best_candidate = candidates[best_idx]
 
+        # Update global best
         if gen_best_fit > best_fit:
             best_fit = gen_best_fit
             best_candidate = gen_best_candidate.copy()
@@ -506,6 +472,7 @@ def train_mlp_cma(
             break
 
     return best_candidate, best_fit
+
 
 
 
@@ -555,7 +522,7 @@ def train_mlp_de(generations=20, pop_size=20, T=20, seed=50,
 
     # Calculate fitness for each candidate, pop[i] = candidate
     for i in range(pop_size):
-        fits[i] = evaluate_fitness3(pop[i], model, data, ctrl, network, core_bind, T, alpha=0.2)
+        fits[i] = evaluate_fitness(pop[i], model, data, ctrl, network, core_bind, T, alpha=0.2)
         #fits[i] = -loss  # fitness
    
     best_idx = int(np.argmax(fits))
@@ -584,7 +551,7 @@ def train_mlp_de(generations=20, pop_size=20, T=20, seed=50,
             trial = np.where(cross, mutant, pop[i])
 
             # Evaluate trial
-            f_trial = evaluate_fitness3(trial, model, data, ctrl, network,core_bind, T, alpha = 0.2)
+            f_trial = evaluate_fitness(trial, model, data, ctrl, network,core_bind, T, alpha = 0.2)
             #f_trial = -loss
 
             # If trial is better than parent than trial enters population
@@ -609,8 +576,193 @@ def train_mlp_de(generations=20, pop_size=20, T=20, seed=50,
     return best_candidate, best_fit
 
 
+
+import numpy as np
+import random as pyrand
+from deap import base, creator, tools
+from functools import partial
+
+def train_mlp_ga(out_csv=None, generations=100, pop_size=60, T=10.0, seed=0,
+                 model=None, data=None, core_bind=None, hidden=32, freq_hz=1.0,
+                 crossover_prob=0.6, mutation_prob=0.3, mut_sigma=0.3, alpha=0.2,
+                 tracker=None, world=None):
+    """
+    Genetic Algorithm on MLP parameters using DEAP. Maximizes fitness.
+    Returns (best_theta, best_fitness).
+    """
+    rng = np.random.default_rng(seed)
+    pyrand.seed(seed)
+    np.random.seed(seed)
+
+    # Initialize MLP controller
+    nu = model.nu
+    network = MLPController(nu=nu, hidden=hidden, freq_hz=freq_hz)
+    n_params = network.n_params
+    network.set_params(rng.normal(0.0, 0.5, size=n_params))
+
+    # Tracker setup if provided
+    if tracker is not None and world is not None:
+        tracker.setup(world.spec, data)
+
+    ctrl = Controller(
+        controller_callback_function=partial(mlp_forward, network=network, core_bind=core_bind),
+        tracker=tracker
+    )
+
+    # DEAP creator setup
+    try:
+        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    except Exception:
+        pass
+    try:
+        creator.create("Individual", list, fitness=creator.FitnessMax)
+    except Exception:
+        pass
+
+    # DEAP toolbox
+    toolbox = base.Toolbox()
+    toolbox.register("attr_float", pyrand.gauss, 0.0, 0.5)
+    toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, n=n_params)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+    # Evaluation
+    def eval_ind(individual):
+        theta = np.asarray(individual, dtype=np.float64)
+        fitness = evaluate_fitness(theta, model, data, ctrl, network, core_bind, T, alpha=alpha)
+        return (fitness,)
+
+    toolbox.register("evaluate", eval_ind)
+    toolbox.register("mate", tools.cxBlend, alpha=0.5)
+    toolbox.register("mutate", tools.mutGaussian, mu=0.0, sigma=mut_sigma, indpb=1.0/n_params)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    # Initialize population
+    population = toolbox.population(n=pop_size)
+
+    # Evaluate initial population
+    for ind in population:
+        ind.fitness.values = toolbox.evaluate(ind)
+
+    # Evolution loop
+    for g in range(generations):
+        # Selection
+        offspring = list(map(toolbox.clone, toolbox.select(population, len(population))))
+
+        # Crossover
+        for i in range(0, len(offspring)-1, 2):
+            if pyrand.random() < crossover_prob:
+                toolbox.mate(offspring[i], offspring[i+1])
+                del offspring[i].fitness.values
+                del offspring[i+1].fitness.values
+
+        # Mutation
+        for ind in offspring:
+            if pyrand.random() < mutation_prob:
+                toolbox.mutate(ind)
+                del ind.fitness.values
+
+        # Evaluate invalid individuals
+        invalid = [ind for ind in offspring if not ind.fitness.valid]
+        for ind in invalid:
+            ind.fitness.values = toolbox.evaluate(ind)
+
+        # Replace population
+        population = offspring
+
+        # Logging
+        fits = np.array([ind.fitness.values[0] for ind in population])
+        if (g + 1) % max(1, generations // 10) == 0:
+            print(f"[mlp_ga seed {seed}] Gen {g+1}/{generations}: best={np.max(fits):.3f}, mean={np.mean(fits):.3f}")
+
+    # Return best individual
+    best_ind = tools.selBest(population, 1)[0]
+    best_theta = np.asarray(best_ind, dtype=np.float64)
+    best_fit = float(best_ind.fitness.values[0])
+
+    return best_theta, best_fit
+
+
+import numpy as np
+from functools import partial
+
+def train_mlp_pso_mujoco(
+    generations=100,
+    pop_size=30,
+    T=25.0,
+    seed=0,
+    model=None,
+    data=None,
+    core_bind=None,
+    hidden=32,
+    freq_hz=1.0,
+    w=0.5,
+    c1=1.5,
+    c2=1.5,
+    alpha=0.2,
+):
+    rng = np.random.default_rng(seed)
+    np.random.seed(seed)
+
+    nu = model.nu
+    network = MLPController(nu=nu, hidden=hidden, freq_hz=freq_hz)
+    n_params = network.n_params
+
+    # Initialize particles
+    population = [rng.normal(0.0, 0.5, size=n_params) for _ in range(pop_size)]
+    velocities = [rng.normal(0.0, 0.1, size=n_params) for _ in range(pop_size)]
+
+    # Initialize personal bests
+    pbest_positions = [p.copy() for p in population]
+    pbest_scores = []
+    ctrl = Controller(controller_callback_function=partial(mlp_forward, network=network, core_bind=core_bind))
+
+    for theta in population:
+        fitness = evaluate_fitness(theta, model, data, ctrl, network, core_bind, T, alpha)
+        pbest_scores.append(fitness)
+
+    # Initialize global best
+    gbest_idx = int(np.argmax(pbest_scores))
+    gbest_position = pbest_positions[gbest_idx].copy()
+    gbest_score = pbest_scores[gbest_idx]
+
+    for gen in range(generations):
+        for i in range(pop_size):
+            r1 = rng.random(n_params)
+            r2 = rng.random(n_params)
+
+            # PSO update
+            velocities[i] = (
+                w * velocities[i]
+                + c1 * r1 * (pbest_positions[i] - population[i])
+                + c2 * r2 * (gbest_position - population[i])
+            )
+            population[i] = population[i] + velocities[i]
+
+            # Evaluate new position
+            theta = population[i]
+            fitness = evaluate_fitness(theta, model, data, ctrl, network, core_bind, T, alpha)
+
+            # Update personal best
+            if fitness > pbest_scores[i]:
+                pbest_scores[i] = fitness
+                pbest_positions[i] = theta.copy()
+
+                # Update global best
+                if fitness > gbest_score:
+                    gbest_score = fitness
+                    gbest_position = theta.copy()
+
+        if (gen + 1) % max(1, generations // 10) == 0:
+            print(f"[mlp_pso seed {seed}] Gen {gen+1}/{generations}: best={gbest_score:.3f}")
+
+    return gbest_position, gbest_score
+
+
+
+
 def experiment2():
     core = create_body()
+    core = gecko()
     tracker = create_tracker()
 
     #Inialize world and model
@@ -646,25 +798,56 @@ def experiment2():
     nu = model.nu
     tracker.setup(core.spec, data)
     core_bind = tracker.to_track[0]
-    theta, best_fit = train_mlp_de(
-                generations=20, pop_size=20, T=20, seed=5,
-                model=model, data=data, core_bind=core_bind,
-                hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, tracker = tracker, alpha = 0.2, world = world
-            )
-    #theta, best_fit = train_mlp_cma( generations=20,
-     #pop_size=50,
-     #T=10.0,
-     #seed=50,
-     #model=model,
-     #data=data,
-     #core_bind=core_bind,
-     #hidden=32,
-     #freq_hz=1.0,
-     #sigma=0.5,
-     #init_scale=0.5,
-     #tracker=tracker,
-     #alpha=0.2,
-     #world=world)
+    # theta, best_fit = train_mlp_de(
+    #             generations=50, pop_size=50, T=20, seed=5,
+    #             model=model, data=data, core_bind=core_bind,
+    #             hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, tracker = tracker, alpha = 0.2, world = world
+    #         )
+    
+#     theta, best_fit = train_mlp_ga(
+#     generations=20,
+#     pop_size=20,
+#     T=5.0,
+#     seed=42,
+#     model=model,
+#     data=data,
+#     core_bind=core_bind,
+#     hidden=32,
+#     freq_hz=1.0,
+#     tracker=tracker,
+#     world=world
+# )
+    theta, best_fit = train_mlp_cma( generations=80,
+     pop_size=30,
+     T=10.0,
+     seed=50,
+     model=model,
+     data=data,
+     core_bind=core_bind,
+     hidden=32,
+     freq_hz=1.0,
+     sigma=0.5,
+     init_scale=0.5,
+     tracker=tracker,
+     alpha=0.2,
+     world=world)
+    
+
+
+    # theta, best_fit =  train_mlp_pso_mujoco(
+    # generations=10,
+    # pop_size=10,
+    # T=20.0,
+    # seed=0,
+    # model=model,
+    # data=data,
+    # core_bind=core_bind,
+    # hidden=32,
+    # freq_hz=1.0,
+    # w=0.5,
+    # c1=1.5,
+    # c2=1.5,
+    # alpha=0.2)
     
     mj.mj_resetData(model, data)
     network = MLPController(nu=nu, hidden=32, freq_hz=1.0)
@@ -687,7 +870,10 @@ def experiment2():
     simple_runner(model, data, duration=50)
 
     viewer.launch(model=model, data=data)
-    
+
+
+    show_xpos_history(tracker.history["xpos"][0])
+
 
 
 
@@ -705,6 +891,7 @@ def experiment(
     """Run the simulation with random movements."""
     # ==================================================================== #
     # Initialise controller to controller to None, always in the beginning.
+    
     mj.set_mjcb_control(None)  # DO NOT REMOVE
 
     # Initialise world
