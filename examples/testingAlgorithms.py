@@ -405,9 +405,15 @@ def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5,fit
             solutions = es.ask()
             fitnesses = []
 
-            for sol in solutions:
-                genotype = unflatten_genotype(np.clip(sol, 0, 1).astype(np.float32))
-                body = makeBody(num_modules=20, genotype=genotype)
+            for index in range(len(solutions)):
+                body = None
+                new_solution = None
+                while body is None:
+                    new_solution = es.ask(1)
+                    genotype = unflatten_genotype(np.clip(new_solution, 0, 1).astype(np.float32))
+                    body = makeBody(num_modules=20, genotype=genotype)
+                if new_solution:
+                    solutions[index] = new_solution[0]
                 individual = Make_randomIndividual(body, genotype,fitnessfunction)
                 fitness = individual["fitness"]
                 fitnesses.append(fitness) 
