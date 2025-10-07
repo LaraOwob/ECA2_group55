@@ -1002,7 +1002,7 @@ def visualize_evolved_robot():
     # Verify match before loading
     expected = sum(p.numel() for p in nn_obj.parameters())
     if len(params) != expected:
-        print(f"\n❌ MISMATCH: Saved controller ({len(params)}) doesn't match robot ({expected})")
+        print(f"\n MISMATCH: Saved controller ({len(params)}) doesn't match robot ({expected})")
         print("The saved controller was trained on a different morphology.")
         return
     
@@ -1021,7 +1021,7 @@ def visualize_evolved_robot():
     ctrl = Controller(controller_callback_function=control_cb, tracker=tracker)
     mj.set_mjcb_control(ctrl.set_control)
     
-    print(f"\n✅ Loaded robot with fitness: {np.load(data_dir / 'best_fitness.npy'):.3f}")
+    print(f"\n Loaded robot with fitness: {np.load(data_dir / 'best_fitness.npy'):.3f}")
     print("Launching viewer...")
     
     viewer.launch(model=model, data=data)
