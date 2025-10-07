@@ -43,12 +43,13 @@ from ariel.simulation.environments import OlympicArena
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
 #from stable_baselines3 import SAC
-import gym
-from gym import spaces
 import os
 import cma
 from scipy.optimize import differential_evolution
 import csv
+
+from pyswarm import pso
+
 # Type Checking
 if TYPE_CHECKING:
     from networkx import DiGraph
@@ -237,54 +238,6 @@ def evaluateFitness(
 
 
 
-class OlympicEnv(gym.Env):
-    def __init__(self, robot,world):
-        super().__init__()
-        # Init world + robot
-        mj.set_mjcb_control(None)
-        self.world = world
-
-        # Build MuJoCo model/data
-        self.model = self.world.spec.compile()
-        self.data = mj.MjData(self.model)
-
-        # Action/obs spaces
-        self.n_actions = self.model.nu
-        self.n_obs = self.model.nq + self.model.nv
-        self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_actions,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.n_obs,), dtype=np.float32)
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        mj.mj_resetData(self.model, self.data)
-        return self._get_obs(), {}
-
-    def step(self, action):
-        self.data.ctrl[:] = action
-        mj.mj_step(self.model, self.data)
-        obs = self._get_obs()
-
-        reward = self._compute_reward(obs, action)
-        done = self._check_done()
-        truncated = False
-
-        return obs, reward, done, truncated, {}
-
-    def _get_obs(self):
-        return np.concatenate([self.data.qpos, self.data.qvel]).astype(np.float32)
-
-    def _compute_reward(self, obs, action):
-        # Placeholder: define task-specific reward
-        return -np.linalg.norm(obs)
-
-    def _check_done(self):
-        # Placeholder: define when episode ends
-        return False
-
-
-
-
-
 
 
 
@@ -448,6 +401,30 @@ def PSOmethod(fitness,dim): # still to finish
     best_cost, best_pos = optimizer.optimize(fitness, iters=50)
     print("Best PSO solution:", best_pos)
 
+
+
+
+
+# Define the objective function
+def objective_function(x):
+    RNG = np.random.default_rng()  # No fixed seed
+    fitness = RNG.random()
+    return fitness
+
+def PSO_method():
+    # Define bounds for each dimension
+    lb = [-10, -10]  # lower bounds
+    ub = [10, 10]    # upper bounds
+
+    # Run PSO
+    best_position, best_score = pso(objective_function, lb, ub, swarmsize=30, maxiter=100)
+
+    print("Best Position:", best_position)
+    print("Best Score:", best_score)
+    return best_position, best_score
+
+
+
 def MapElites(fitness, dim): #still to finish
     # Archive: 2D map based on (mean vec1, mean vec2)
     archive = GridArchive(
@@ -559,7 +536,10 @@ def evolvePopulation(population, elite_fraction=0.2, mutation_rate=0.1):
 # ----------------------------
 def main():
     print("Starting evolutionary algorithm...")
-    train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=10, pop_size=10, seed=SEED)
+    #train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=10, pop_size=10, seed=SEED)
+    PSO_method()
+    
+    
     """
     population = initializePopulation(pop_size=10)
     for gen in range(5):
