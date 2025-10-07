@@ -113,6 +113,14 @@ class NNController(nn.Module):
     
 
 def makeBody(num_modules: int = 20, genotype=None):
+    """
+    Add the random moves method to check if the body is feasible
+    or not so give it a quick simulation
+    1. If feasible, then return the body
+    2. If not feasible, create a new body
+    
+    """
+
     nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
     p_matrices = nde.forward(genotype)
 
@@ -122,8 +130,12 @@ def makeBody(num_modules: int = 20, genotype=None):
     )
 
     core = construct_mjspec_from_graph(robot_graph)
-
-    return core
+    #simulate core quickly to see if it is feasible
+    bad_body = False
+    if bad_body:
+        return core
+    else:
+        return None
 
 def makeGenotype(num_modules: int = 20):
     genotype_size = 64
@@ -142,6 +154,7 @@ def makeNeuralNetwork(nu: int, hidden_size: int = 8):
     return NNController(nu=nu, hidden_size=hidden_size)
 
 def makeIndividual(body,genotype):
+    
     global BODY_COLLECTION
     global BEST_FITNESS
     #Create a body
@@ -191,7 +204,22 @@ def initializePopulation(pop_size: int = 10, num_modules: int = 20,fitnessfuncti
     return population, all_fitness
 
 
-
+def PSO_update(rng,velocities, population, pbest_positions, gbest_position, i, w, c1, c2):
+    new_velocity = []
+    new_position = []
+    for d in range(3):
+        r1 = rng.random(64)
+        r2 = rng.random(64)
+        inertia = w * velocities[i][d]
+        cognitive = c1 * r1 * (pbest_positions[i][d] - population[i]["genotype"][d])
+        social = c2 * r2 * (gbest_position[d] - population[i]["genotype"][d])
+        v_new = inertia + cognitive + social
+        x_new = population[i]["genotype"][d] + v_new
+        x_new = np.clip(x_new, 0, 1)
+        new_velocity.append(v_new)
+        new_position.append(x_new)
+    return new_velocity, new_position
+                    
 def train_mlp_pso(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=None, data=None, core_bind=None,
                   hidden=32, freq_hz=1.0, w=0.5, c1=1.5, c2=1.5,fitnessfunction = 'sphere'):
     rng = np.random.default_rng(seed)
@@ -224,22 +252,14 @@ def train_mlp_pso(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=N
 
         for g in range(generations):
             for i in range(pop_size):
-                new_velocity = []
-                new_position = []
-                for d in range(3):
-                    r1 = rng.random(64)
-                    r2 = rng.random(64)
-                    inertia = w * velocities[i][d]
-                    cognitive = c1 * r1 * (pbest_positions[i][d] - population[i]["genotype"][d])
-                    social = c2 * r2 * (gbest_position[d] - population[i]["genotype"][d])
-                    v_new = inertia + cognitive + social
-                    x_new = population[i]["genotype"][d] + v_new
-                    x_new = np.clip(x_new, 0, 1)
-                    new_velocity.append(v_new)
-                    new_position.append(x_new)
-
-                velocities[i] = new_velocity
-                new_body = makeBody(num_modules=20, genotype=new_position)
+                new_body = None
+                new_position = None
+                while new_body is None:
+                    new_velocity,new_position = PSO_update(rng,velocities, population, pbest_positions, gbest_position, i, w, c1, c2)   
+                    velocities[i] = new_velocity
+                    new_body = makeBody(num_modules=20, genotype=new_position)
+                
+                    
                 new_individual = Make_randomIndividual(new_body, new_position,fitnessfunction)
                 new_fitness = new_individual["fitness"]
 
