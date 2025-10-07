@@ -128,7 +128,7 @@ def main():
     # These are standard parts of the simulation USE THEM AS IS, DO NOT CHANGE
     model = world.spec.compile()
     data = mujoco.MjData(model)  # type: ignore
-
+    print("this is the QACC",data.qacc)
     # Initialise data tracking
     # to_track is automatically updated every time step
     # You do not need to touch it.

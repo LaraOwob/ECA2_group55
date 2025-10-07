@@ -67,7 +67,7 @@ import os
 # Type Checking
 if TYPE_CHECKING:
     from networkx import DiGraph
-print("helololololololo")
+type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 
 SEED = 42
 RNG = np.random.default_rng(SEED)
@@ -111,6 +111,211 @@ class NNController(nn.Module):
         y = self.tanh(self.fc3(h))
         return CTRL_RANGE * y
     
+    
+    
+    
+    
+    
+
+def nn_controller(
+    model: mj.MjModel,
+    data: mj.MjData,
+) -> npt.NDArray[np.float64]:
+    # Simple 3-layer neural network
+    input_size = len(data.qpos)
+    hidden_size = 8
+    output_size = model.nu
+
+    # Initialize the networks weights randomly
+    # Normally, you would use the genes of an individual as the weights,
+    # Here we set them randomly for simplicity.
+    w1 = RNG.normal(loc=0.0138, scale=0.5, size=(input_size, hidden_size))
+    w2 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, hidden_size))
+    w3 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, output_size))
+
+    # Get inputs, in this case the positions of the actuator motors (hinges)
+    inputs = data.qpos
+
+    # Run the inputs through the lays of the network.
+    layer1 = np.tanh(np.dot(inputs, w1))
+    layer2 = np.tanh(np.dot(layer1, w2))
+    outputs = np.tanh(np.dot(layer2, w3))
+
+    # Scale the outputs
+    return outputs * np.pi
+
+
+
+def is_model_stable(model, data):
+    """Return False if NaNs, Infs, or huge values appear before simulation."""
+    # Forward all computations once
+    mj.mj_forward(model, data)
+    
+    if (
+        np.any(np.isnan(data.qpos)) or
+        np.any(np.isnan(data.qvel)) or
+        np.any(np.isnan(data.qacc)) or
+        np.any(np.isinf(data.qpos)) or
+        np.any(np.isinf(data.qvel)) or
+        np.any(np.isinf(data.qacc))
+    ):
+        print("❌ NaN/Inf detected in state variables")
+        return False
+
+    if np.max(np.abs(data.qacc)) > 1e5:  # arbitrary large threshold
+        print(f"⚠️ Unstable: excessive acceleration (max={np.max(np.abs(data.qacc)):.2e})")
+        return False
+
+   # if np.min(model.body_mass) < 1e-6:
+    #    print("⚠️ Unstable: body mass too small")
+     #   return False
+
+    return True
+
+
+
+
+
+def experiment(
+    robot: Any,
+    controller: Controller,
+    duration: int = 5,
+    mode: ViewerTypes = "simple",
+
+) -> None:
+    """Run the simulation with random movements."""
+    # ==================================================================== #
+    # Initialise controller to controller to None, always in the beginning.
+    mj.set_mjcb_control(None)  # DO NOT REMOVE
+
+    # Initialise world
+    # Import environments from ariel.simulation.environments
+    world = OlympicArena()
+
+    # Spawn robot in the world
+    # Check docstring for spawn conditions
+    world.spawn(robot.spec, spawn_position=[0, 0, 0.1])
+
+    # Generate the model and data
+    # These are standard parts of the simulation USE THEM AS IS, DO NOT CHANGE
+    model = world.spec.compile()
+    data = mj.MjData(model)
+    
+    # Reset state and time of simulation
+    mj.mj_resetData(model, data)
+    mj.mj_forward(model, data)
+    if not is_model_stable(model, data):
+        print("🚫 Bad robot detected — rejecting body")
+        return None
+    
+    # Pass the model and data to the tracker
+    if controller.tracker is not None:
+        controller.tracker.setup(world.spec, data)
+
+    # Set the control callback function
+    # This is called every time step to get the next action.
+    args: list[Any] = []  # IF YOU NEED MORE ARGUMENTS ADD THEM HERE!
+    kwargs: dict[Any, Any] = {}  # IF YOU NEED MORE ARGUMENTS ADD THEM HERE!
+
+    mj.set_mjcb_control(
+        lambda m, d: controller.set_control(m, d, *args, **kwargs),
+    )
+
+    # ------------------------------------------------------------------ #
+    
+    # ✅ Record starting position
+    start_position = np.copy(data.qpos[:2])  # store x,y
+    
+    match mode:
+        
+        case "simple":
+            # This disables visualisation (fastest option)
+            simple_runner(
+                model,
+                data,
+                duration=duration,
+            )
+        case "frame":
+            # Render a single frame (for debugging)
+            save_path = str(DATA / "robot.png")
+            single_frame_renderer(model, data, save=True, save_path=save_path)
+        case "video":
+            # This records a video of the simulation
+            path_to_video_folder = str(DATA / "videos")
+            video_recorder = VideoRecorder(output_folder=path_to_video_folder)
+
+            # Render with video recorder
+            video_renderer(
+                model,
+                data,
+                duration=duration,
+                video_recorder=video_recorder,
+            )
+        case "launcher":
+            # This opens a liver viewer of the simulation
+            viewer.launch(
+                model=model,
+                data=data,
+            )
+        case "no_control":
+            # If mj.set_mjcb_control(None), you can control the limbs manually.
+            mj.set_mjcb_control(None)
+            viewer.launch(
+                model=model,
+                data=data,
+            )
+            
+     # ✅ After simulation — record end position
+    end_position = np.copy(data.qpos[:2])  # final x,y
+
+    # ✅ Compute Euclidean distance travelled
+    distance = np.linalg.norm(end_position - start_position)
+
+    # Return the scalar distance
+    return distance
+    # ==================================================================== #
+
+
+
+
+
+import numpy as np
+
+def check_robot_validity(p_type, p_conn, p_rot, hinge_type_index=1, min_hinges=1):
+    """
+    Check if the robot genotype decodes to a feasible morphology.
+    - p_type: (num_modules, num_types)
+    - p_conn: (num_modules, num_modules, num_faces)
+    - p_rot:  (num_modules, num_rotations)
+    """
+
+    num_modules = p_type.shape[0]
+
+    # 1️⃣ Count number of hinges
+    # Get predicted type index for each module
+    module_types = np.argmax(p_type, axis=1)
+    hinge_count = np.sum(module_types == hinge_type_index)
+    # 2️⃣ Check number of connections (adjacency)
+    # Sum over all faces → adjacency matrix
+    adjacency = np.sum(p_conn, axis=2)
+    adjacency = (adjacency + adjacency.T) / 2  # symmetric
+    connected = adjacency > 0.5  # threshold
+    # 3️⃣ Check connectivity — every node should be reachable from core (0)
+    visited = set()
+    def dfs(node):
+        visited.add(node)
+        for neighbor, is_conn in enumerate(connected[node]):
+            if is_conn and neighbor not in visited:
+                dfs(neighbor)
+
+    dfs(0)
+    is_fully_connected = len(visited) == num_modules
+
+    # ✅ Return boolean
+    return hinge_count >= min_hinges and is_fully_connected, hinge_count
+
+
+
 
 def makeBody(num_modules: int = 20, genotype=None):
     """
@@ -120,18 +325,36 @@ def makeBody(num_modules: int = 20, genotype=None):
     2. If not feasible, create a new body
     
     """
-
+   
     nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
     p_matrices = nde.forward(genotype)
-
     hpd = HighProbabilityDecoder(num_modules)
     robot_graph = hpd.probability_matrices_to_graph(
         p_matrices[0], p_matrices[1], p_matrices[2]
     )
-
+  
     core = construct_mjspec_from_graph(robot_graph)
     #simulate core quickly to see if it is feasible
-    bad_body = False
+    mujoco_type_to_find = mj.mjtObj.mjOBJ_GEOM
+    name_to_bind = "core"
+    tracker = Tracker(
+        mujoco_obj_to_find=mujoco_type_to_find,
+        name_to_bind=name_to_bind,
+    )
+    # ? ------------------------------------------------------------------ #
+    # Simulate the robot
+    ctrl = Controller(
+        controller_callback_function=nn_controller,
+        # controller_callback_function=random_move,
+        tracker=tracker,
+    )
+    distance = experiment(robot=core, controller=ctrl, mode="launcher")
+    print("Distance travelled:", distance)
+    if distance == None:
+        print("invalid body")
+        return None
+    
+    bad_body = True
     if bad_body:
         return core
     else:
@@ -139,12 +362,21 @@ def makeBody(num_modules: int = 20, genotype=None):
 
 def makeGenotype(num_modules: int = 20):
     genotype_size = 64
-    type_p = RNG.random(genotype_size).astype(np.float32)
-    conn_p = RNG.random(genotype_size).astype(np.float32)
-    rot_p = RNG.random(genotype_size).astype(np.float32)
-    genotype = [type_p, conn_p, rot_p]
+    valid_body = False
+    genotype = None
+    k=0
+    while not valid_body:
+        type_p = RNG.random(genotype_size).astype(np.float32)
+        conn_p = RNG.random(genotype_size).astype(np.float32)
+        rot_p = RNG.random(genotype_size).astype(np.float32)
+        valid_body  = check_robot_validity(type_p, conn_p, rot_p, hinge_type_index=1, min_hinges=1)
+        genotype = [type_p, conn_p, rot_p]
+        k+=1
+    print("Valid body found after", k, "iterations \n\n\n")
     body = makeBody(num_modules, genotype)
+        
     
+        
 
     return body, genotype
 
@@ -163,13 +395,9 @@ def makeIndividual(body,genotype):
         return BODY_COLLECTION[body]
     
     else:
-        mj.set_mjcb_control(None)
-        world = OlympicArena()
-        world.spawn(body.spec, spawn_position=[2.0, 0, 0.1], correct_for_bounding_box=False)
-        model = world.spec.compile() 
-        nu = model.nu
+        
         #Pass numm hinges as inputsize NN 
-        nn_obj = makeNeuralNetwork(nu=nu, hidden_size=8)
+        nn_obj = 0
         #Set target_position
         target_pos = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
@@ -197,7 +425,7 @@ def initializePopulation(pop_size: int = 10, num_modules: int = 20,fitnessfuncti
     for _ in range(pop_size):
         core, genotype = makeGenotype(num_modules)
 
-        indiv = Make_randomIndividual(core,genotype,fitnessfunction)
+        indiv = MakeIndividual(core,genotype)
         all_fitness.append(indiv["fitness"])
         population.append(indiv)
         
@@ -404,17 +632,28 @@ def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5,fit
         for g in range(generations):
             solutions = es.ask()
             fitnesses = []
-
+            print(f"this is generation {g} \n\n\n")
             for index in range(len(solutions)):
-                body = None
-                new_solution = None
-                while body is None:
-                    new_solution = es.ask(1)
+                sampled = False
+                new_solution = solutions[index]
+                genotype = unflatten_genotype(np.clip(new_solution, 0, 1).astype(np.float32))
+                nde = NeuralDevelopmentalEncoding(number_of_modules=20)
+                p_matrices = nde.forward(genotype)
+                valid_body,_ =  check_robot_validity(p_matrices[0], p_matrices[1], p_matrices[2],hinge_type_index=1, min_hinges=1)
+                while not valid_body:
+                    print("not valid body")
+                    new_solution = es.ask(1)[0]
                     genotype = unflatten_genotype(np.clip(new_solution, 0, 1).astype(np.float32))
-                    body = makeBody(num_modules=20, genotype=genotype)
-                if new_solution:
-                    solutions[index] = new_solution[0]
-                individual = Make_randomIndividual(body, genotype,fitnessfunction)
+                    nde = NeuralDevelopmentalEncoding(number_of_modules=20)
+                    p_matrices = nde.forward(genotype)
+                    valid_body,_ =  check_robot_validity(p_matrices[0], p_matrices[1], p_matrices[2],hinge_type_index=1, min_hinges=1)
+                    sampled = True
+                
+                body = makeBody(num_modules=20, genotype=genotype)
+                
+                if sampled: # if a new solution was sampled, update it in the solutions list
+                    solutions[index] = new_solution
+                individual = makeIndividual(body, genotype)
                 fitness = individual["fitness"]
                 fitnesses.append(fitness) 
                 if fitness < best_fit:
@@ -428,11 +667,11 @@ def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5,fit
             gen_mean = float(np.mean(fitnesses))
             gen_median = float(np.median(fitnesses))
             writer.writerow([g, gen_best, gen_mean, gen_median])
-
+    print("finished")
     return best_candidate, best_fit
 
 
-def TrainDummyNet(nn_obj: NNController):   
+def TrainDummyNet(nn_obj): #(nn_obj: NNController):   
     RNG = np.random.default_rng(SEED)  # No fixed seed
     fitness = RNG.random()
     return None, fitness
@@ -623,19 +862,17 @@ def Testruntime_plot(fitnessfunctions =['sphere','rastrigin','rosenbrock','ackle
 
 
 def main():
-    Testruntime_plot()
+    #Testruntime_plot()
     print("Starting evolutionary algorithm...")
-    start_de = time.time()
-    best_candidate_DE, best_fit_DE = train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=10, pop_size=10, seed=SEED)
-    end_de = time.time()
-    start_pso = time.time()
-    best_candidate_PSO, best_fit_PSO = train_mlp_pso(out_csv=str(DATA / "mlp_pso3_results.csv"), generations=10, pop_size=10, seed=SEED)
-    end_pso = time.time()
-    print("Best DE candidate fitness:", best_fit_DE)
-    print("Best PSO candidate fitness:", best_fit_PSO)
-    print("DE Time:", end_de - start_de)
-    print("PSO Time:", end_pso - start_pso)
-
+    
+    #start_de = time.time()
+    #best_candidate_DE, best_fit_DE = train_mlp_de(out_csv=str(DATA / "mlp_de3_results.csv"), generations=10, pop_size=10, seed=SEED)
+    #end_de = time.time()
+    start_cmaes = time.time()
+    best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=str(DATA / "mlp_cmae_results.csv"), generations=10, pop_size=10, seed=SEED)
+    end_cmaes = time.time()
+    print("Best CMAE candidate fitness:", best_fit_CMAES)
+    print("CMAES Time:", end_cmaes - start_cmaes)
 
 if __name__ == "__main__":
     main()
