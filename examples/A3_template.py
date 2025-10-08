@@ -330,7 +330,7 @@ def makeIndividual(body,genotype):
                 "genotype": genotype,
                 "robot_spec": body,
                 "nn": None,
-                "fitness": 100000
+                "fitness": 1.5
             }
         return individual
     else:
@@ -427,7 +427,7 @@ def TrainDummyNet(nn_obj): #(nn_obj: NNController):
 
 
 
-def plot(file_path):
+def plot(file_path,output_path):
         # --- Load your results file ---
     # Works for both .csv and .xlsx
 
@@ -454,14 +454,20 @@ def plot(file_path):
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-
     plt.show()
-def main(mode):
-    match mode:
-        case "algorithm":
+    # === Save the plot ===
+    plt.savefig(output_path, dpi=300)
+    print(f"✅ Plot saved to {output_path}")
+    
+    
+    
+def main(action, generations = 100, pop_size = 150):
+    file_path =  f"MLP_CMAES_{generations}_{pop_size}_results.csv"
+    if action == "algorithm":
+        
         print("Starting evolutionary algorithm...")
         start_cmaes = time.time()
-        best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=str(DATA / "mlp_cmae_results.csv"), generations=100, pop_size=100, seed=SEED)
+        best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=str(DATA /file_path ), generations=generations, pop_size=pop_size, seed=SEED)
         end_cmaes = time.time()
         print("Best CMAE candidate fitness:", best_fit_CMAES)
         print("CMAES Time:", end_cmaes - start_cmaes)
@@ -470,7 +476,12 @@ def main(mode):
         if best_candidate_CMAES["robot_spec"]:
             print("find a body")
             makeBody(genotype = best_candidate_CMAES["genotype"], simulation = "launcher", duration = 15)
-        case "plot"
-            plot("mlp_cmae_results.csv")
+    if action == "plot":
+        output_path = "plot" + file_path[:-4] + ".png"
+        plot(str(DATA / file_path),output_path)
+            
+            
 if __name__ == "__main__":
-    main()
+    action = "plot" # 'plot' or 'algorithm'
+    main(action)
+    
