@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
+from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import HighProbabilityDecoder
 from ariel.body_phenotypes.robogen_lite.constructor import construct_mjspec_from_graph
 from ariel.simulation.environments import OlympicArena
@@ -42,7 +43,7 @@ RESULTS_CSV = OUTDIR / "results.csv"
 
 # ────────────────────────────────────────────────────────────────────────────────
 # ==== globals ====
-SPAWN_POS        = [-0.8, 0, 0.1]
+SPAWN_POS        = [0, 0, 0.1]
 NUM_OF_MODULES   = 30
 TARGET_POSITION  = [5, 0, 0.5]   # z used only for distance calc / plotting
 FINISH_RADIUS    = 0.15          # tweak if your arena uses a different threshold

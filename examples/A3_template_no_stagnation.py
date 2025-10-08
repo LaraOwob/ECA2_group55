@@ -262,9 +262,11 @@ def evaluateFitness(model: mj.MjModel,
     proximity_bonus = max(0.0, 3.0 - dist_to_target)
     
     # Small time penalty to encourage speed
-    time_penalty = 0.01 * duration
+
+    # add something to reward climbing?
+    #time_penalty = 0.01 * duration
     
-    fitness = progress_x + proximity_bonus - time_penalty
+    fitness = progress_x + proximity_bonus #- time_penalty
     
     return fitness
 
