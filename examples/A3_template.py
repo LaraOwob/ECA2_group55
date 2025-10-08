@@ -3,6 +3,7 @@
 # Standard library
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+import pandas as pd
 
 # Third-party libraries
 import matplotlib.pyplot as plt
@@ -43,7 +44,8 @@ type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 # --- RANDOM GENERATOR SETUP --- #
 SEED = 42
 RNG = np.random.default_rng(SEED)
-TARGET_POS = np.array([0, -2, 0.1])
+TARGET_POS = np.array([4.5, 0.0, 0.55])
+
 SPAWN=[0, 0, 0.1]
 
 # --- DATA SETUP ---
@@ -379,6 +381,174 @@ def evaluate_fitness3(theta, model, data, ctrl, network, core_bind, T, alpha = 0
 
 
 
+def evaluate_fitness4(theta, model, data, ctrl, network, core_bind, spawn_pos, T, alpha=0.2):
+    """
+    Evaluate fitness of a candidate theta on the current terrain.
+    Rewards forward progress toward target and penalizes lateral drift and falling.
+    """
+
+    # --- Set network parameters ---
+    network.set_params(theta)
+
+    # --- Reset simulation ---
+    mj.mj_resetData(model, data)
+
+    # --- Assign controller ---
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind=core_bind)
+    mj.set_mjcb_control(ctrl.set_control)
+
+    start_pos = np.array(spawn_pos)
+    target_pos = np.array(TARGET_POS)
+    lateral_weight = 0.5
+    fall_penalty = 5
+
+    # --- Run simulation ---
+    simple_runner(model, data, duration=T)
+
+    final_pos = data.xpos[core_bind.id].copy()
+    delta_pos = final_pos - start_pos
+
+    # --- Direction vector toward target ---
+    direction = target_pos - start_pos
+    direction /= np.linalg.norm(direction)
+
+    # --- Forward progress along target direction ---
+    forward_progress = np.dot(delta_pos, direction)
+
+    # --- Lateral drift penalty (perpendicular to target direction) ---
+    lateral_vector = delta_pos - forward_progress * direction
+    lateral_pen = lateral_weight * np.linalg.norm(lateral_vector[:2])  # only x/y drift
+
+    # --- Fall penalty ---
+    fall_pen = fall_penalty if final_pos[2] < 0.2 else 0.0
+
+    # --- Total fitness (higher is better) ---
+    fitness = forward_progress - lateral_pen - fall_pen
+
+    return fitness
+
+
+def evaluate_fitness5(theta, model, data, ctrl, network, core_bind, spawn_pos, T, alpha=0.2):
+                      
+    alpha_speed=0.5
+    #alpha_align=0.9 
+    lateral_weight=0.1
+    fall_penalty=20.0
+    """
+    Fitness function for a robot to move toward a target while facing it.
+    """
+    # Set network parameters
+    network.set_params(theta)
+
+    # Reset simulation
+    mj.mj_resetData(model, data)
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind=core_bind)
+    mj.set_mjcb_control(ctrl.set_control)
+
+    start_pos = np.array(spawn_pos)
+    target_pos = np.array(TARGET_POS)
+    direction = target_pos - start_pos
+    dist_to_target = np.linalg.norm(direction[:2])
+
+    if dist_to_target < 1e-6:  # avoid division by zero
+        direction[:2] = np.array([1.0, 0.0])
+        dist_to_target = 1.0
+    else:
+        direction /= dist_to_target
+
+    # Run simulation
+    simple_runner(model, data, duration=T)
+
+    # Final displacement
+    final_pos = data.xpos[core_bind.id].copy()
+    delta_pos = final_pos - start_pos
+
+    # --- Forward progress along target (normalized) ---
+    forward_progress = np.dot(delta_pos[:2], direction[:2]) / dist_to_target
+
+    # --- Lateral drift penalty ---
+    lateral_vector = delta_pos[:2] - np.dot(delta_pos[:2], direction[:2]) * direction[:2]
+    lateral_pen = lateral_weight * np.linalg.norm(lateral_vector)
+
+
+    # --- Speed reward ---
+    speed = np.linalg.norm(delta_pos[:2]) / T
+    speed_reward = alpha_speed * speed
+
+    # --- Fall penalty ---
+    fall_pen = fall_penalty if final_pos[2] < 0.0 else 0.0
+
+    # --- Total fitness ---
+    fitness = 3 * forward_progress + speed_reward - lateral_pen - fall_pen
+
+    return fitness
+
+
+def evaluate_fitness6(theta, model, data, ctrl, network, core_bind, spawn_pos, T, alpha=0.2):
+
+
+    alpha_forward = 2.0     # strong forward reward
+    alpha_lateral = 0.5     # penalize sideways drift moderately
+    alpha_speed = 0.3       # reward moving fast
+    alpha_orient = 0.6     # reward facing target
+    fall_penalty = 20.0     # heavy fall penalty
+    upright_bonus = 1.0     # reward staying upright
+
+    target_pos = np.array([5.0, 0.0, 0.1])
+
+    # --- Set network params ---
+    network.set_params(theta)
+    mj.mj_resetData(model, data)
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind=core_bind)
+    mj.set_mjcb_control(ctrl.set_control)
+
+    start_pos = np.array(spawn_pos)
+    direction = target_pos - start_pos
+    dist_to_target = np.linalg.norm(direction[:2])
+    if dist_to_target < 1e-6:
+        direction[:2] = np.array([1.0, 0.0])
+        dist_to_target = 1.0
+    else:
+        direction /= dist_to_target
+
+    # --- Run simulation ---
+    simple_runner(model, data, duration=T)
+
+    # --- Final positions ---
+    final_pos = data.xpos[core_bind.id].copy()
+    delta_pos = final_pos - start_pos
+
+    # --- Forward progress (X-axis toward target) ---
+    forward_progress = np.dot(delta_pos[:2], direction[:2])
+
+    # --- Lateral drift penalty ---
+    lateral_vector = delta_pos[:2] - np.dot(delta_pos[:2], direction[:2]) * direction[:2]
+    lateral_pen = alpha_lateral * np.linalg.norm(lateral_vector)
+
+    # --- Orientation reward ---
+    vel_xy = data.qvel[:2]
+    if np.linalg.norm(vel_xy) > 1e-8:
+        vel_dir = vel_xy / np.linalg.norm(vel_xy)
+    else:
+        vel_dir = direction[:2]  # fallback if no movement
+    orientation_reward = alpha_orient * max(0.0, np.dot(vel_dir, direction[:2]))
+
+    # --- Speed reward ---
+    speed = np.linalg.norm(delta_pos[:2]) / T
+    speed_reward = alpha_speed * speed
+
+    # --- Upright posture bonus ---
+    #body_height = final_pos[2]
+    #height_gain = max(0, body_height - start_pos[2])
+    #upright_reward = upright_bonus * height_gain
+
+    # --- Fall penalty ---
+    fall_pen = fall_penalty if final_pos[2] < 0.0 else 0.0
+
+    # --- Total fitness ---
+    fitness = alpha_forward * forward_progress + speed_reward  - lateral_pen - fall_pen
+
+    return fitness
 
 
 
@@ -387,193 +557,260 @@ def evaluate_fitness3(theta, model, data, ctrl, network, core_bind, T, alpha = 0
 
 
 
+
+
+
+
+def evaluate_fitness_all_terrains(theta, model, data, ctrl, network, core_bind, spawn_choices, T):
+    scores = []
+    for spawn_pos in spawn_choices.values():
+        f = evaluate_fitness5(theta, model, data, ctrl, network, core_bind, spawn_pos, T, alpha=0.2)
+        scores.append(f)
+    return np.mean(scores)
+
+
+
+
+import os
+import csv
+import numpy as np
 import cma
 from functools import partial
-import numpy as np
-
+import time
 
 def train_mlp_cma(
-    generations=20,
+    generations=None,
     pop_size=None,
-    T=30.0,
+    T=15.0,
     seed=50,
-    model=None,
-    data=None,
-    core_bind=None,
+    output_csv=None,
     hidden=32,
     freq_hz=1.0,
-    sigma=0.5,
+    sigma=0.59,
     init_scale=0.5,
-    tracker=None,
     alpha=0.2,
-    world=None,
 ):
-    """
-    CMA-ES optimization for MLP controller parameters (maximizing fitness).
-    """
+    import os, csv, time, numpy as np, cma
+    from functools import partial
+
     rng = np.random.default_rng(seed)
     np.random.seed(seed)
 
-    # Initialize MLP controller
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
+    core = gecko()
+    mj.set_mjcb_control(None)
+    world = OlympicArena()
+
+    # --- Before CMA loop ---
+    start_time = time.time()
+
+    # --- Create output directory ---
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+
+    # --- Terrain spawn zones ---
+    spawn_choices = {
+     #   "flat": [-1.0, 0.0, 0.1],
+        "rugged": [0.5, 0.0, 0.1],
+        "incline": [2.5, 0.0, 0.1]
+    }
+    terrains = list(spawn_choices.keys())
+    probs = [2/3, 1/3]
+
+    # --- Spawn robot once ---
+    world.spawn(core.spec, spawn_position=[0, 0, 0.1])
+    model = world.spec.compile()
+    data = mj.MjData(model)
+
+    # --- Tracker setup ---
+    tracker.setup(world.spec, data)
+    core_bind = tracker.to_track[0]
+
+    # --- Get number of actuators ---
     nu = model.nu
     network = MLPController(nu=nu, hidden=hidden, freq_hz=freq_hz)
     num_params = network.n_params
-    mean_init = rng.normal(0.0, init_scale, size=num_params)
 
-    # Tracker setup
-    if tracker is not None and world is not None:
+    # --- Initialize CSV ---
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["generation", "best_fitness", "mean_fitness", "median_fitness", "terrain", "elapsed_time"] + [f"theta_{i}" for i in range(num_params)]
+        writer.writerow(header)
+
+        # --- Initialize CMA-ES ---
+        #mean_init = rng.normal(0.0, init_scale, size=num_params)
+
+        best_theta = np.load("./dataA3/CMA_results_day2_final_best_theta_cma_day2.npy", allow_pickle=True)
+        best_theta = np.array(best_theta, dtype=np.float64).flatten()
+
+        mean_init = best_theta.copy()
+
+        es = cma.CMAEvolutionStrategy(mean_init, sigma, {
+            "popsize": pop_size,
+            "seed": seed,
+            "maxiter": generations,
+            "verb_disp": 1
+        })
+
+        best_candidate = None
+        best_fit = -np.inf
+
+        for gen in range(generations):
+            # --- Move robot to terrain spawn ---
+            chosen_terrain = np.random.choice(terrains, p=probs)
+            spawn_pos = spawn_choices[chosen_terrain]
+            data.qpos[:3] = spawn_pos
+            data.qvel[:] = 0
+            mj.mj_step(model, data, nstep=10)
+
+            # --- Controller ---
+            ctrl = Controller(
+                controller_callback_function=partial(mlp_forward, network=network, core_bind=core_bind),
+                tracker=tracker
+            )
+
+            # --- Evaluate candidates ---
+            candidates = es.ask()
+            fitnesses = []
+            for cand in candidates:
+                fit = evaluate_fitness_all_terrains(
+                    cand, model, data, ctrl, network, core_bind, spawn_choices, T
+                )
+                fitnesses.append(-fit)
+
+            es.tell(candidates, fitnesses)
+            es.disp()
+
+            # --- Track best ---
+            best_idx = int(np.argmin(fitnesses))
+            gen_best_fit = -fitnesses[best_idx]
+            gen_best_candidate = candidates[best_idx]
+
+            if gen_best_fit > best_fit:
+                best_fit = gen_best_fit
+                best_candidate = gen_best_candidate.copy()
+
+            mean_fit = -np.mean(fitnesses)
+            median_fit = -np.median(fitnesses)
+
+            # --- Write generation row ---
+            writer.writerow([gen, gen_best_fit, mean_fit, median_fit, chosen_terrain, ""] + list(gen_best_candidate))
+
+        # --- Save final best with runtime ---
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        minutes = int(elapsed_time // 60)
+        seconds = int(elapsed_time % 60)
+        elapsed_str = f"{minutes}:{seconds:02d}"
+
+        writer.writerow(["final_best", best_fit, "", "", "", elapsed_str] + list(best_candidate))
+        np.save(output_csv.replace(".csv", "_final_best_theta_cma_day2.npy"), best_candidate)
+
+    return best_candidate, best_fit
+
+
+
+
+
+
+
+
+
+
+
+
+def train_mlp_de(generations=20, pop_size=20, T=20, seed=50, model=None, output_csv = None, data=None, core_bind=None, hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, tracker=None, alpha=0.2, world = SimpleFlatWorld):
+    """
+    Differential Evolution for MLP parameters.
+    Saves per-generation stats and best θ to a single CSV.
+    """
+
+    import os
+    import csv
+    import numpy as np
+    from functools import partial
+
+    rng = np.random.default_rng(seed)
+    nu = model.nu
+
+    network = MLPController(nu=nu, hidden=hidden, freq_hz=freq_hz)
+    number_params = network.n_params
+    network.set_params(rng.normal(0.0, 0.5, size=number_params))
+
+    if tracker is not None:
         tracker.setup(world.spec, data)
 
-    # Controller wrapper
     ctrl = Controller(
         controller_callback_function=partial(mlp_forward, network=network, core_bind=core_bind),
         tracker=tracker
     )
 
-    # CMA-ES setup
-    es = cma.CMAEvolutionStrategy(mean_init, sigma, {
-        "popsize": pop_size,
-        "seed": seed,
-        "maxiter": generations,
-        "verb_disp": 1
-    })
-
-    best_candidate = None
-    best_fit = -np.inf  # we want to maximize fitness
-
-    # Evolution loop
-    for gen in range(generations):
-        candidates = es.ask()
-        fitnesses = []
-
-        # Evaluate all candidates
-        for cand in candidates:
-            fit = evaluate_fitness3(cand, model, data, ctrl, network, core_bind, T, alpha=alpha)
-            # Negate because CMA minimizes by default
-            fitnesses.append(-fit)
-
-        es.tell(candidates, fitnesses)
-        es.disp()
-
-        # Correctly identify the best candidate in this generation
-        best_idx = int(np.argmin(fitnesses))  # min(-fitness) = max(fitness)
-        gen_best_fit = -fitnesses[best_idx]   # revert negation
-        gen_best_candidate = candidates[best_idx]
-
-        # Update global best
-        if gen_best_fit > best_fit:
-            best_fit = gen_best_fit
-            best_candidate = gen_best_candidate.copy()
-
-        if (gen + 1) % max(1, generations // 10) == 0:
-            print(f"[mlp_cma seed {seed}] Gen {gen+1}/{generations}: best={gen_best_fit:.3f}")
-
-        if es.stop():
-            break
-
-    return best_candidate, best_fit
-
-
-
-
-
-
-
-
-
-def train_mlp_de(generations=20, pop_size=20, T=20, seed=50,
-                 model=None, data=None, core_bind=None,
-                 hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5,
-                 tracker=None, alpha=0.2, world = SimpleFlatWorld):
-    
-
-  
-    """
-    Simple, Differential Evolution for MLP parameters.
-    """
-    #Selects random number
-    # 
-    # 
-    # 
-    #  
-    rng = np.random.default_rng(seed)
-    print(model)
-    nu = model.nu
-    print(model.nu)
-    network = MLPController(nu=nu, hidden=32, freq_hz=1.0)
-    number_params = network.n_params
-    random_theta = rng.normal(0.0, 0.5, size=number_params)
-    network.set_params(random_theta)
-
-    
-
-    if tracker is not None:
-        tracker.setup(world.spec, data)
-    ctrl = Controller(
-        controller_callback_function=partial(mlp_forward, network=network, core_bind = core_bind),
-        tracker=tracker
-    )
-
-    # Initialize population by sampling normal distribution with mean 0 and stdv of init_scale
-    pop = rng.normal(loc=0.0, scale=init_scale, size=(pop_size,number_params ))
-    #Initialize empty numby array with length number of candidates
+    # Initialize population
+    pop = rng.normal(loc=0.0, scale=init_scale, size=(pop_size, number_params))
     fits = np.empty(pop_size, dtype=np.float64)
-   
 
-    # Calculate fitness for each candidate, pop[i] = candidate
+    # Evaluate initial fitness
     for i in range(pop_size):
-        fits[i] = evaluate_fitness(pop[i], model, data, ctrl, network, core_bind, T, alpha=0.2)
-        #fits[i] = -loss  # fitness
-   
+        fits[i] = evaluate_fitness(pop[i], model, data, ctrl, network, core_bind, T, alpha=alpha)
+
     best_idx = int(np.argmax(fits))
     best_candidate = pop[best_idx].copy()
     best_fit = float(fits[best_idx])
 
+    # Create output directory
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
 
-    for g in range(generations):
-        for i in range(pop_size):
-            #Select all indices expcept for i, the candidate you want to mutate
-            choices = []
-            for index in range(pop_size):
-                if index != i:
-                    choices.append(index)
-            #Out of valid choices, choose 3 random candidates 
-            a, b, c = rng.choice(choices, size=3, replace=False)
-            #Mutant candidate:
-            mutant = pop[a] + F * (pop[b] - pop[c])
+    # Open CSV for writing all stats + best theta
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["generation", "best_fitness", "mean_fitness", "median_fitness"] + [f"theta_{i}" for i in range(number_params)]
+        writer.writerow(header)
 
-            # Crossover (binomial), between parent and mutant
-            #Creates list of length weights whether each gene will be changed or stays like parent. Returns FAlse or True list
-            cross = rng.random(number_params) < CR
-            #At least one random gene will be open for crossover with mutant
-            cross[rng.integers(0, number_params)] = True 
-            #The genes which were chosen by cross validation proability are adjusted
-            trial = np.where(cross, mutant, pop[i])
+        for g in range(generations):
+            for i in range(pop_size):
+                # Choose 3 distinct candidates
+                idxs = [idx for idx in range(pop_size) if idx != i]
+                a, b, c = rng.choice(idxs, size=3, replace=False)
 
-            # Evaluate trial
-            f_trial = evaluate_fitness(trial, model, data, ctrl, network,core_bind, T, alpha = 0.2)
-            #f_trial = -loss
+                # Mutation
+                mutant = pop[a] + F * (pop[b] - pop[c])
 
-            # If trial is better than parent than trial enters population
-            if f_trial >= fits[i]:
-                pop[i] = trial
-                fits[i] = f_trial
+                # Crossover
+                cross = rng.random(number_params) < CR
+                cross[rng.integers(0, number_params)] = True
+                trial = np.where(cross, mutant, pop[i])
 
-        # Retrieve stats: best fitness, mean fitness and median fitness and write to csv
-        gen_best = float(np.max(fits))
-        gen_mean = float(np.mean(fits))
-        gen_median = float(np.median(fits))
+                # Evaluate trial
+                f_trial = evaluate_fitness(trial, model, data, ctrl, network, core_bind, T, alpha=alpha)
 
-        # Update and check best candidate with best fitness
-        if gen_best > best_fit:
-            best_fit = gen_best
-            best_candidate = pop[int(np.argmax(fits))].copy()
+                # Selection
+                if f_trial >= fits[i]:
+                    pop[i] = trial
+                    fits[i] = f_trial
 
-        #Print every after every 10th generation
-        if (g + 1) % max(1, generations // 10) == 0:
-            print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
+            # Stats
+            gen_best_idx = int(np.argmax(fits))
+            gen_best_theta = pop[gen_best_idx].copy()
+            gen_best = float(fits[gen_best_idx])
+            gen_mean = float(np.mean(fits))
+            gen_median = float(np.median(fits))
+
+            # Update global best
+            if gen_best > best_fit:
+                best_fit = gen_best
+                best_candidate = gen_best_theta.copy()
+
+            # Write to CSV: best fitness + mean/median + best theta
+            writer.writerow([g, gen_best, gen_mean, gen_median] + list(gen_best_theta))
+
+            # Print progress
+            print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.4f} mean={gen_mean:.4f}")
+            print(f"Best theta (first 5 params): {gen_best_theta[:5]}")
+
+        # Save final best candidate as .npy
+        np.save(output_csv.replace(".csv", "_final_best_theta.npy"), best_candidate)
 
     return best_candidate, best_fit
+
 
 
 
@@ -757,52 +994,117 @@ def train_mlp_pso_mujoco(
 
     return gbest_position, gbest_score
 
-
-
-
-def experiment2():
-    core = create_body()
+def run_results():
     core = gecko()
     tracker = create_tracker()
 
-    #Inialize world and model
+    # #Inialize world and model
     mj.set_mjcb_control(None) 
-    world = SimpleFlatWorld()
+    world = OlympicArena()
 
-    # Spawn robot in the world
+    # # Spawn robot in the world
     world.spawn(core.spec, spawn_position=[0, 0, 0.1])
     world.spec.worldbody.add_geom(
     type=mj.mjtGeom.mjGEOM_SPHERE,
     name="target_marker",
     size=[0.05, 0.0, 0.0],          
-    pos=TARGET_POS, 
+    pos=[4.5, 0.0, 0.55], 
     rgba=[1, 0, 0, 1],  
     contype=0,            
     conaffinity=0)
 
-    # Generate the model and data
+   
+   
+    # # Generate the model and data
     model = world.spec.compile()
     data = mj.MjData(model)
+    nu = model.nu
+    mj.mj_resetData(model, data)
+    network = MLPController(nu=nu, hidden=32, freq_hz=1.0)
+    results = pd.read_csv('./dataA3/CMA_results_day2.csv')
+    row = results.iloc[-1]
+    #row = results[results['generation']== 79]
+    best_theta = row.filter(like='theta').to_numpy(dtype=np.float64).flatten()
 
-    # current_pos is the robot root position right after spawn
-    current_pos = data.xpos[0]  # shape (3,)
+     # Load saved theta
+    theta = np.load("./dataA3/CMA_results_day2_final_best_theta_cma_day2.npy", allow_pickle=True)
 
-    # Compute Euclidean distance to target (2D or 3D)
-    delta = TARGET_POS[:3] - current_pos  # or [:2] if you only care about XY
-    distance = np.linalg.norm(delta)
+#    Convert to flat float array
+    best_theta = np.array(theta, dtype=np.float64).flatten()     
+          
+        
+    network.set_params(best_theta)
 
-    print("Distance to target after spawn:", distance)
+    if tracker is not None:
+        tracker.setup(world.spec, data)
+    core_bind = tracker.to_track[0]
+
+    ctrl = Controller(
+        controller_callback_function=partial(mlp_forward, network=network, core_bind = core_bind),
+        tracker=tracker
+    )
+    
+    # Assign network forward as controller callback
+    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind = core_bind)
+    
+    # Set controller in MuJoCo
+    mj.set_mjcb_control(ctrl.set_control)
+    print('hello')
+    
+    # Run simulation
+    simple_runner(model, data, duration=50)
+
+    viewer.launch(model=model, data=data)
+
+
+    show_xpos_history(tracker.history["xpos"][0])
+
+
+
+def experiment2():
+    # core = create_body()
+    # core = gecko()
+    # tracker = create_tracker()
+
+    # #Inialize world and model
+    # mj.set_mjcb_control(None) 
+    # world = OlympicArena()
+
+    # # Spawn robot in the world
+    # world.spawn(core.spec, spawn_position=[0, 0, 0.1])
+    # world.spec.worldbody.add_geom(
+    # type=mj.mjtGeom.mjGEOM_SPHERE,
+    # name="target_marker",
+    # size=[0.05, 0.0, 0.0],          
+    # pos=TARGET_POS, 
+    # rgba=[1, 0, 0, 1],  
+    # contype=0,            
+    # conaffinity=0)
+
+    # # Generate the model and data
+    # model = world.spec.compile()
+    # data = mj.MjData(model)
+
+    # # current_pos is the robot root position right after spawn
+    # current_pos = data.xpos[0]  # shape (3,)
+
+    # # Compute Euclidean distance to target (2D or 3D)
+    # delta = TARGET_POS[:3] - current_pos  # or [:2] if you only care about XY
+    # distance = np.linalg.norm(delta)
+
+    # print("Distance to target after spawn:", distance)
 
   
-    #Number of hinges
-    nu = model.nu
-    tracker.setup(core.spec, data)
-    core_bind = tracker.to_track[0]
-    # theta, best_fit = train_mlp_de(
-    #             generations=50, pop_size=50, T=20, seed=5,
-    #             model=model, data=data, core_bind=core_bind,
-    #             hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, tracker = tracker, alpha = 0.2, world = world
-    #         )
+    # #Number of hinges
+    # nu = model.nu
+    # tracker.setup(core.spec, data)
+    # core_bind = tracker.to_track[0]
+    #output_csv = './dataA3/mlp_de_results.csv'
+    #theta, best_fit = train_mlp_de(
+     #            generations=1, pop_size=10, T=20, seed=5,
+     #           model=model,output_csv= output_csv, data=data, core_bind=core_bind, 
+     #            hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, tracker = tracker, alpha = 0.2, world = world
+      #       )
     
 #     theta, best_fit = train_mlp_ga(
 #     generations=20,
@@ -817,20 +1119,24 @@ def experiment2():
 #     tracker=tracker,
 #     world=world
 # )
-    theta, best_fit = train_mlp_cma( generations=80,
-     pop_size=30,
-     T=10.0,
-     seed=50,
-     model=model,
-     data=data,
-     core_bind=core_bind,
-     hidden=32,
-     freq_hz=1.0,
-     sigma=0.5,
-     init_scale=0.5,
-     tracker=tracker,
-     alpha=0.2,
-     world=world)
+    output_csv = './dataA3/CMA_results.csv'
+    output_csv = './dataA3/CMA_results_day2.csv'
+    theta, best_fit = train_mlp_cma( generations=120,
+    pop_size=40,
+    T=10.0,
+    seed=50,
+    #model=model,
+    output_csv = output_csv,
+    #data=data,
+    #core_bind=core_bind,
+    hidden=32,
+    freq_hz=1.0,
+    sigma=0.59,
+    init_scale=0.5,
+    #tracker=tracker,
+    alpha=0.2,
+    #world=world
+    )
     
 
 
@@ -848,31 +1154,7 @@ def experiment2():
     # c1=1.5,
     # c2=1.5,
     # alpha=0.2)
-    
-    mj.mj_resetData(model, data)
-    network = MLPController(nu=nu, hidden=32, freq_hz=1.0)
-    network.set_params(theta)
-    if tracker is not None:
-        tracker.setup(world.spec, data)
 
-    ctrl = Controller(
-        controller_callback_function=partial(mlp_forward, network=network, core_bind = core_bind),
-        tracker=tracker
-    )
-    
-    # Assign network forward as controller callback
-    ctrl.controller_callback_function = partial(mlp_forward, network=network, core_bind = core_bind)
-    
-    # Set controller in MuJoCo
-    mj.set_mjcb_control(ctrl.set_control)
-    
-    # Run simulation
-    simple_runner(model, data, duration=50)
-
-    viewer.launch(model=model, data=data)
-
-
-    show_xpos_history(tracker.history["xpos"][0])
 
 
 
@@ -1056,7 +1338,8 @@ def main() -> None:
     )
 
     #experiment(robot=core, controller=ctrl, mode="simple")
-    experiment2()
+    #experiment2()
+    run_results()
 
     # show_xpos_history(tracker.history["xpos"][0])
 
