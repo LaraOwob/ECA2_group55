@@ -83,6 +83,7 @@ DATA.mkdir(exist_ok=True)
 CTRL_RANGE = 1.0
 BODY_COLLECTION = {}
 BEST_FITNESS= 0
+WORKING_BODIES =set()
 # ----------------------------
 # Neural Network Controller
 # ----------------------------
@@ -281,7 +282,7 @@ def experiment(
 
 
 
-def makeBody(num_modules: int = 20, genotype=None):
+def makeBody(num_modules: int = 20, genotype=None, simulation = "timestep", duration = 5):
     """
     Add the random moves method to check if the body is feasible
     or not so give it a quick simulation
@@ -296,7 +297,7 @@ def makeBody(num_modules: int = 20, genotype=None):
     robot_graph = hpd.probability_matrices_to_graph(
         p_matrices[0], p_matrices[1], p_matrices[2]
     )
-    construct_mjspec_from_graph(robot_graph)
+    core = construct_mjspec_from_graph(robot_graph)
         
    
     #simulate core quickly to see if it is feasible
@@ -313,25 +314,26 @@ def makeBody(num_modules: int = 20, genotype=None):
         # controller_callback_function=random_move,
         tracker=tracker,
     )
-    distance = experiment(robot=core, controller=ctrl, mode="timestep")
-    print("Distance travelled:", distance)
+    distance = experiment(robot=core, controller=ctrl, mode=simulation,duration = duration)
     if distance ==None:
         return None
     else:
+        WORKING_BODIES.add(core)
         return core
 
 
 def makeIndividual(body,genotype):
-    
-    global BODY_COLLECTION
-    global BEST_FITNESS
     #Create a body
     #Spawn core to get model, for nu
-    if body in BODY_COLLECTION:
-        return BODY_COLLECTION[body]
-    
+    if body == None:
+        individual ={
+                "genotype": genotype,
+                "robot_spec": body,
+                "nn": None,
+                "fitness": 100000
+            }
+        return individual
     else:
-        
         #Pass numm hinges as inputsize NN 
         nn_obj = 0
         #Set target_position
@@ -347,9 +349,7 @@ def makeIndividual(body,genotype):
                 "nn": trained_nn,
                 "fitness": fitness
             }
-        BODY_COLLECTION[body] = individual
-        if fitness > BEST_FITNESS:  
-            BEST_FITNESS = fitness
+       
         return individual
     
     
@@ -377,7 +377,7 @@ def unflatten_genotype(flat_vector):
     """Convert a 192-element vector back into a genotype (3 vectors of size 64)."""
     return [flat_vector[0:64], flat_vector[64:128], flat_vector[128:192]]
 
-def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5,fitnessfunction = 'sphere'):
+def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5):
     """
     CMA-ES for evolving robot genotypes with dummy fitness evaluation.
     """
@@ -398,35 +398,17 @@ def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5,fit
 
         for g in range(generations):
             solutions = es.ask()
-            valid_solutions = []
             fitnesses = []
             print(f"this is generation {g} \n\n\n")
             for sol in solutions:
                 genotype = unflatten_genotype(np.clip(sol, 0.1, 0.9).astype(np.float32))
-                if not is_genotype_valid(genotype):
-                    # skip / resample before building MJCF
-                    new_solution = es.ask(1)[0]
-                    genotype = unflatten_genotype(np.clip(new_solution, 0, 1).astype(np.float32))
-                new_solution = None
-                new_sample = False
-                body = None
-                while body == None:
-                    print("got a bad body")
-                    new_solution = es.ask(1)[0]
-                    genotype = unflatten_genotype(np.clip(new_solution, 0, 1).astype(np.float32))
-                    body = makeBody(num_modules=20, genotype=genotype)
-                if new_sample:
-                    valid_solutions.append(new_solution)
-                else:
-                    valid_solutions.append(sol)
-                
+                body = makeBody(num_modules=20, genotype=genotype)
                 individual = makeIndividual(body, genotype)
                 fitness = individual["fitness"]
                 fitnesses.append(fitness) 
                 if fitness < best_fit:
                     best_fit = fitness
                     best_candidate = individual
-            solutions = valid_solutions
             es.tell(solutions, fitnesses)
 
             # Stats for CSV
@@ -443,13 +425,52 @@ def TrainDummyNet(nn_obj): #(nn_obj: NNController):
     fitness = RNG.random()
     return None, fitness
 
-def main():
-    print("Starting evolutionary algorithm...")
-    start_cmaes = time.time()
-    best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=str(DATA / "mlp_cmae_results.csv"), generations=10, pop_size=10, seed=SEED)
-    end_cmaes = time.time()
-    print("Best CMAE candidate fitness:", best_fit_CMAES)
-    print("CMAES Time:", end_cmaes - start_cmaes)
 
+
+def plot(file_path):
+        # --- Load your results file ---
+    # Works for both .csv and .xlsx
+
+    if file_path.endswith(".csv"):
+        df = pd.read_csv(file_path)
+    else:
+        df = pd.read_excel(file_path)
+
+    # --- Inspect columns ---
+    print("Columns:", df.columns.tolist())
+
+    # Assuming your file has columns: generation, best_fitness, mean_fitness, median_fitness
+    plt.figure(figsize=(8, 5))
+
+    # --- Plot the fitness trends ---
+    plt.plot(df["generation"], df["best_fitness"], label="Best fitness", linewidth=2)
+    plt.plot(df["generation"], df["mean_fitness"], label="Mean fitness", linestyle="--")
+    plt.plot(df["generation"], df["median_fitness"], label="Median fitness", linestyle=":")
+
+    # --- Add labels and styling ---
+    plt.xlabel("Generation", fontsize=12)
+    plt.ylabel("Fitness", fontsize=12)
+    plt.title("CMA-ES Fitness over Generations", fontsize=14)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plt.show()
+def main(mode):
+    match mode:
+        case "algorithm":
+        print("Starting evolutionary algorithm...")
+        start_cmaes = time.time()
+        best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=str(DATA / "mlp_cmae_results.csv"), generations=100, pop_size=100, seed=SEED)
+        end_cmaes = time.time()
+        print("Best CMAE candidate fitness:", best_fit_CMAES)
+        print("CMAES Time:", end_cmaes - start_cmaes)
+        #simulate core quickly to see if it is feasible
+        print(f"CMAES found {len(WORKING_BODIES)} bodies in total")
+        if best_candidate_CMAES["robot_spec"]:
+            print("find a body")
+            makeBody(genotype = best_candidate_CMAES["genotype"], simulation = "launcher", duration = 15)
+        case "plot"
+            plot("mlp_cmae_results.csv")
 if __name__ == "__main__":
     main()
