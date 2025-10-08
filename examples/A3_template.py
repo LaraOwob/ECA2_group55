@@ -430,8 +430,10 @@ def TrainDummyNet(nn_obj): #(nn_obj: NNController):
 def plot(file_path,output_path):
         # --- Load your results file ---
     # Works for both .csv and .xlsx
-
+    print(file_path)
+    file_path = str(file_path)
     if file_path.endswith(".csv"):
+        print("its csv")
         df = pd.read_csv(file_path)
     else:
         df = pd.read_excel(file_path)
@@ -461,7 +463,7 @@ def plot(file_path,output_path):
     
     
     
-def main(action, generations = 100, pop_size = 150):
+def main(action, generations = 300, pop_size = 150):
     file_path =  f"MLP_CMAES_{generations}_{pop_size}_results.csv"
     if action == "algorithm":
         
@@ -477,8 +479,11 @@ def main(action, generations = 100, pop_size = 150):
             print("find a body")
             makeBody(genotype = best_candidate_CMAES["genotype"], simulation = "launcher", duration = 15)
     if action == "plot":
-        output_path = "plot" + file_path[:-4] + ".png"
-        plot(str(DATA / file_path),output_path)
+        csv_path = DATA / file_path
+        print(f"Looking for file at: {csv_path.resolve()}")
+
+        output_path = "plot_" + file_path[:-4] + ".png"
+        plot((DATA / file_path),output_path)
             
             
 if __name__ == "__main__":
