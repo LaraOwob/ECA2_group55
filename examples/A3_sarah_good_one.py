@@ -90,14 +90,205 @@ def unflatten_params(net: nn.Module, flat: np.ndarray) -> None:
             p.copy_(torch.tensor(flat[i:i+n].reshape(p.shape), dtype=p.dtype))
             i += n
 
-def nn_obj_control(nn_obj, model, data, target_pos):
-    current_pos = torch.tensor(data.xpos[0], dtype=torch.float32)
-    qpos = torch.tensor(data.qpos[:nn_obj.nu], dtype=torch.float32)
-    qvel = torch.tensor(data.qvel[:nn_obj.nu], dtype=torch.float32)
-    raw = nn_obj(qpos, qvel, data.time, torch.tensor(target_pos), current_pos).detach().numpy()
-    global AMP, MID, CTRL_RANGE_ARR
-    a = MID + AMP * np.clip(raw, -1, 1)
-    return np.clip(a, CTRL_RANGE_ARR[:,0], CTRL_RANGE_ARR[:,1])
+def _bind_geom_name(model: mj.MjModel) -> str:
+    try:
+        _ = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "core")
+        return "core"
+    except Exception:
+        return mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, 0)
+
+
+def nn_control_step(nn_obj, m, d, target_pos):
+    # use body (root) pos for current_pos (as you set up)
+    current_pos = torch.tensor(d.xpos[ROBOT_BODY_ID], dtype=torch.float32)
+
+    qpos = torch.tensor(d.qpos[:nn_obj.nq], dtype=torch.float32)  # nq
+    qvel = torch.tensor(d.qvel[:nn_obj.nv], dtype=torch.float32)  # nv
+
+    raw = nn_obj(qpos, qvel, d.time, torch.tensor(target_pos), current_pos).detach().numpy()
+    # raw has length nu; scale to actuator range:
+    a = MID + (AMP * ACT_GAIN) * np.clip(raw, -1.0, 1.0)
+    return np.clip(a, CTRL_RANGE_ARR[:, 0], CTRL_RANGE_ARR[:, 1])
+
+# ---------- Fitness ----------
+'''def evaluate(model: mj.MjModel,
+             world: OlympicArena,
+             nn_obj: NNController,
+             target_pos: np.ndarray = TARGET_POS,
+             duration: float = DURATION) -> float:
+    mj.set_mjcb_control(None)  # important to clear old callbacks
+    data = mj.MjData(model)
+    mj.mj_resetData(model, data)
+
+    bind = _bind_geom_name(model)
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind=bind)
+    tracker.setup(world.spec, data)
+
+    def _cb(m, d):  # type: ignore # controller callback
+        return nn_control_step(nn_obj, m, d, target_pos)
+    ctrl = Controller(controller_callback_function=_cb, tracker=tracker)
+    mj.set_mjcb_control(ctrl.set_control)
+
+    try:
+        simple_runner(model, data, duration=duration)
+    except Exception as e:
+        print(f"[WARN] Simulation failed: {e}")
+        return -1e6
+
+    path = tracker.history.get("xpos", {})
+    if not path:
+        return -1e6
+    key0 = next(iter(path))
+    traj = np.asarray(path[key0])
+    if traj.size == 0:
+        return -1e6
+
+    start, end = traj[0], traj[-1]
+    progress_x = float(end[0] - start[0])            # forward progress
+    dist_to_target = float(np.linalg.norm(end[:2] - target_pos[:2]))
+    proximity_bonus = max(0.0, 3.0 - dist_to_target) # simple shaping
+    return progress_x + proximity_bonus'''
+
+def rot_to_yaw(xmat9: np.ndarray) -> float:
+    # xmat9 is a 3x3 rotation matrix in row-major (flattened length 9)
+    R = np.array([[xmat9[0], xmat9[1], xmat9[2]],
+                  [xmat9[3], xmat9[4], xmat9[5]],
+                  [xmat9[6], xmat9[7], xmat9[8]]])
+    # yaw from ZYX euler: yaw = atan2(R[1,0], R[0,0])
+    return float(np.arctan2(R[1,0], R[0,0]))
+
+def evaluateFitness(model: mj.MjModel,
+                    world: OlympicArena,
+                    nn_obj: NNController,
+                    target_pos: np.ndarray = np.array(TARGET_POS, dtype=np.float32),
+                    duration: float = 8.0,
+                    # ----- arena section boundaries -----
+                    x_flat_end: float = 0.5,     # flat:   [-2.5, 0.5]
+                    x_rugged_end: float = 2.5,   # rugged: [0.5, 2.5]
+                    x_finish: float = 5.42,      # finish stripe
+                    # ----- weights & tolerances -----
+                    w_flat: float = 1.00,
+                    w_rugged: float = 1.60,      # a tad higher to value rough progress
+                    w_uphill: float = 1.80,
+                    w_finish: float = 10.0,
+                    w_speed: float = 4.0,
+                    w_climb: float = 0.5,
+                    y_tol: float = 0.6,
+                    w_lat: float = 0.5,
+                    fall_pitch_roll_deg: float = 60.0) -> float:
+    """
+    Reward grounded forward progress (harder sections worth more), finishing fast,
+    slight preference for facing +x; penalize sideways drift, sliding, moving backward,
+    tipping, going below floor, and leaving arena bounds.
+    """
+    # --- reset & install control callback ---
+    mj.set_mjcb_control(None)
+    data = mj.MjData(model)
+    mj.mj_resetData(model, data)
+
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_BODY,
+                      name_to_bind=ROBOT_BODY_NAME)
+    tracker.setup(world.spec, data)
+
+    def _cb(m, d):  # controller callback
+        return nn_control_step(nn_obj, m, d, target_pos)
+    ctrl = Controller(controller_callback_function=_cb, tracker=tracker)
+    mj.set_mjcb_control(ctrl.set_control)
+
+    # --- simulate ---
+    try:
+        simple_runner(model, data, duration=duration)
+    except Exception as e:
+        print(f"[WARN] Simulation failed: {e}")
+        return -1e6
+
+    # --- trajectory from tracker ---
+    hist = tracker.history.get("xpos", {})
+    if not hist:
+        return -1e6
+    key = next(iter(hist))
+    traj = np.asarray(hist[key])  # [T,3]
+    if traj.shape[0] < 2:
+        return -1e6
+
+    xs, ys, zs = traj[:, 0], traj[:, 1], traj[:, 2]
+    x0, y0, z0 = traj[0]
+    xT, yT, zT = traj[-1]
+
+    # --- floor breach penalty (fell underground) ---
+    fell_below_floor = bool(np.any(zs < 0.0))
+    floor_pen = 20.0 if fell_below_floor else 0.0
+
+    # --- section-weighted grounded forward progress ---
+    dx = np.diff(xs)
+    x_mid = 0.5 * (xs[1:] + xs[:-1])
+
+    # only credit progress when near ground (reduce "flying" exploits)
+    near_ground = (zs[:-1] <= z0 + 0.15)   # slightly tighter gate
+    credited_dx = np.clip(dx, 0.0, None) * near_ground.astype(float)
+
+    section_w = np.where(
+        x_mid < x_flat_end, w_flat,
+        np.where(x_mid < x_rugged_end, w_rugged, w_uphill)
+    )
+    progress = float(np.sum(credited_dx * section_w))
+
+    # --- finish + speed bonus (must be grounded at end) ---
+    finished = (xT >= x_finish) and (zT <= z0 + 0.20)
+    finish_bonus = w_finish if finished else 0.0
+    speed_bonus = 0.0
+    if finished:
+        idx_finish = int(np.argmax(xs >= x_finish))
+        t_finish = (idx_finish / max(1, (len(xs) - 1))) * duration
+        speed_bonus = w_speed * max(0.0, (duration - t_finish) / duration)
+
+    # --- climb bonus (small) ---
+    climb_bonus = w_climb * max(0.0, (zT - z0))
+
+    # --- lateral deviation (soft tolerance) ---
+    y_mean_abs = float(np.mean(np.abs(ys)))
+    lateral_pen = w_lat * max(0.0, y_mean_abs - y_tol)
+
+    # --- lateral velocity penalty (discourage persistent sliding) ---
+    dt = duration / max(1, len(xs) - 1)
+    vy = np.diff(ys) / dt if len(ys) > 1 else np.array([0.0])
+    w_latvel = 0.3
+    latvel_pen = w_latvel * float(np.mean(np.clip(np.abs(vy) - 0.05, 0.0, None)))
+
+    # --- backward motion penalty ---
+    neg_dx = np.clip(-np.diff(xs), 0.0, None)
+    w_back = 0.5
+    back_pen = w_back * float(np.sum(neg_dx))
+
+    # --- out-of-bounds penalty (falling off sides) ---
+    arena_half_width = getattr(world, "arena_width", 2.0) / 2.0
+    margin = 0.05
+    oob = bool(np.any(np.abs(ys) > (arena_half_width - margin)))
+    oob_pen = 10.0 if oob else 0.0
+
+    # --- fall penalty via BODY orientation (roll/pitch) ---
+    xmat9 = data.xmat[ROBOT_BODY_ID].copy()  # 3x3 rot matrix (flat 9)
+    R = np.array([[xmat9[0], xmat9[1], xmat9[2]],
+                  [xmat9[3], xmat9[4], xmat9[5]],
+                  [xmat9[6], xmat9[7], xmat9[8]]])
+    pitch = np.arcsin(-R[2, 0])
+    roll  = np.arctan2(R[2, 1], R[2, 2])
+    roll_deg, pitch_deg = np.degrees(roll), np.degrees(pitch)
+    fall = (abs(roll_deg) > fall_pitch_roll_deg) or (abs(pitch_deg) > fall_pitch_roll_deg)
+    fall_pen = 5.0 if fall else 0.0
+
+    # --- heading alignment (tiny nudge to face +x) ---
+    w_yaw_align = 0.05
+    yaw = rot_to_yaw(xmat9)
+    yaw_align = w_yaw_align * np.cos(yaw)
+
+    # --- final score ---
+    fitness = (
+        progress + finish_bonus + speed_bonus + climb_bonus + yaw_align
+        - lateral_pen - latvel_pen - back_pen - fall_pen - floor_pen - oob_pen
+    )
+    return float(fitness)
+
 
 def evaluate_fitness_multiple_spawns(nn_obj, model, world, spawn_positions, duration):
     fitnesses = []
@@ -128,6 +319,7 @@ def evaluate_fitness_multiple_spawns(nn_obj, model, world, spawn_positions, dura
         proximity_bonus = max(0.0, 3.0 - dist_to_target)
         fitnesses.append(progress + proximity_bonus)
     return float(np.mean(fitnesses))
+
 
 # ---------- Training ----------
 def train_nn_cma_multiple_spawns_to_csv(nn_obj, model, world, spawn_positions,
