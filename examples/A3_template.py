@@ -60,6 +60,7 @@ import os
 import time
 import cma
 from pyswarm import pso
+import glob
 
 import time
 import matplotlib.pyplot as plt
@@ -449,27 +450,91 @@ def plot(file_path,output_path):
     
     
     
-def main(action, generations = 100, pop_size = 10):
-    file_path =  f"MLP_CMAES_{generations}_{pop_size}_results.csv"
+    
+    
+    
+    
+def load_series(csv_path):
+    print(csv_path)
+    df = pd.read_csv(csv_path)
+    return df["best_fitness"].to_numpy()
+
+
+def plot_experiment(exp_name, exp_csvs, final_exp ,out_png, window=10, title=None, xlabel="Generation", ylabel="Fitness"):
+    # Load runs
+    print(exp_csvs)
+    exp_runs = [load_series(p) for p in exp_csvs]
+    if len(exp_runs) == 0:
+        print(f"[plot] No runs found for {exp_name}")
+        return
+    L = min(len(r) for r in exp_runs)
+    exp_runs = [r[:L] for r in exp_runs]
+    exp_mean = np.mean(exp_runs, axis=0)
+    exp_std  = np.std(exp_runs, axis=0)
+
+
+    x = np.arange(len(exp_mean))
+    plt.figure(figsize=(8,4.5))
+    # individual runs (light)
+    k = 1 
+    if not  final_exp:
+        for r in exp_runs:
+            plt.plot(np.arange(len(r[:L])), r[:L], linewidth=2, alpha=0.35, label = f"Run {exp_name} {k}")
+            k+=1 
+    # mean + std
+    plt.plot(x, exp_mean, linewidth=2.5, label=f"{exp_name} Mean")
+    if not final_exp:
+        plt.fill_between(x, exp_mean-exp_std, exp_mean+exp_std, alpha=0.25, label=f"{exp_name} ± std", color = "pink")
+
+    
+    plt.xlabel(xlabel); plt.ylabel(ylabel)
+    if title is None:
+        title = f"{exp_name}"
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    plt.savefig(out_png, dpi=150)
+    plt.show()
+    print(f"[plot] Saved {out_png}")
+
+
+
+
+
+    
+def main(action, generations = 25, pop_size = 10, seed = [0,1,2]):
+    
     if action == "algorithm":
-        
-        print(f"Starting evolutionary algorithm with {generations} generations and population {pop_size}...")
-        start_cmaes = time.time()
-        best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=str(DATA /file_path ), generations=generations, pop_size=pop_size, seed=SEED)
-        end_cmaes = time.time()
-        print("Best CMAE candidate fitness:", best_fit_CMAES)
-        print("CMAES Time:", end_cmaes - start_cmaes)
-        #simulate core quickly to see if it is feasible
-        print(f"CMAES found {len(WORKING_BODIES)} bodies in total")
+        best_candidate_CMAES = None
+        for s in seed:
+            file_path =  f"./results/CMAES/CMAES_{generations}_{pop_size}_seed{s}.csv"
+            print(f"Starting evolutionary algorithm with {generations} generations and population {pop_size} and seed {s}...")
+            start_cmaes = time.time()
+            best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=file_path, generations=generations, pop_size=pop_size, seed=s)
+            end_cmaes = time.time()
+            print(f"Seed {s}")
+            print("Best CMAE candidate fitness:", best_fit_CMAES)
+            print("CMAES Time:", end_cmaes - start_cmaes)
+            #simulate core quickly to see if it is feasible
+            print(f"CMAES found {len(WORKING_BODIES)} bodies in total \n\n\n")
         if best_candidate_CMAES["robot_spec"]:
             print("find a body")
             makeBody(genotype = best_candidate_CMAES["genotype"], simulation = "launcher", duration = 15)
     if action == "plot":
-        csv_path = DATA / file_path
-        print(f"Looking for file at: {csv_path.resolve()}")
+        exp_csvs = sorted(glob.glob(f"./results/CMAES/CMAES_{generations}_{pop_size}_seed*.csv"))
+        print(exp_csvs)
+        plot_experiment(exp_name = "CMAES",
+                        exp_csvs=exp_csvs,
+                        final_exp=False,
+                        out_png=f"./results/plotsA3/CMAES_{generations}_{pop_size}.png",
+                        window=10,
+                        title="fitness of CMAES over generations")
+        #csv_path = DATA / file_path
+        #print(f"Looking for file at: {csv_path.resolve()}")
 
-        output_path = "plot_" + file_path[:-4] + ".png"
-        plot((DATA / file_path),output_path)
+        #output_path = "plot_" + file_path[:-4] + ".png"
+        #plot((DATA / file_path),output_path)
             
             
 if __name__ == "__main__":
