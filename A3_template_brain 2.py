@@ -189,32 +189,32 @@ def show_xpos_history(history: list[float]) -> None:
     plt.show()
 
 
-# def nn_controller(
-#     model: mj.MjModel,
-#     data: mj.MjData,
-# ) -> npt.NDArray[np.float64]:
-#     # Simple 3-layer neural network
-#     input_size = len(data.qpos)
-#     hidden_size = 8
-#     output_size = model.nu
+def nn_controller(
+    model: mj.MjModel,
+    data: mj.MjData,
+) -> npt.NDArray[np.float64]:
+    # Simple 3-layer neural network
+    input_size = len(data.qpos)
+    hidden_size = 8
+    output_size = model.nu
 
-#     # Initialize the networks weights randomly
-#     # Normally, you would use the genes of an individual as the weights,
-#     # Here we set them randomly for simplicity.
-#     w1 = RNG.normal(loc=0.0138, scale=0.5, size=(input_size, hidden_size))
-#     w2 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, hidden_size))
-#     w3 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, output_size))
+    # Initialize the networks weights randomly
+    # Normally, you would use the genes of an individual as the weights,
+    # Here we set them randomly for simplicity.
+    w1 = RNG.normal(loc=0.0138, scale=0.5, size=(input_size, hidden_size))
+    w2 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, hidden_size))
+    w3 = RNG.normal(loc=0.0138, scale=0.5, size=(hidden_size, output_size))
 
-#     # Get inputs, in this case the positions of the actuator motors (hinges)
-#     inputs = data.qpos
+    # Get inputs, in this case the positions of the actuator motors (hinges)
+    inputs = data.qpos
 
-#     # Run the inputs through the lays of the network.
-#     layer1 = np.tanh(np.dot(inputs, w1))
-#     layer2 = np.tanh(np.dot(layer1, w2))
-#     outputs = np.tanh(np.dot(layer2, w3))
+    # Run the inputs through the lays of the network.
+    layer1 = np.tanh(np.dot(inputs, w1))
+    layer2 = np.tanh(np.dot(layer1, w2))
+    outputs = np.tanh(np.dot(layer2, w3))
 
-#     # Scale the outputs
-#     return outputs * np.pi
+    # Scale the outputs
+    return outputs * np.pi
 
 
 #Step 1 of phase A: a dummy brain
@@ -232,18 +232,26 @@ def _sample_cpg_params(nu: int, rng: np.random.Generator = RNG) -> np.ndarray:
     # a = rng.uniform(0.2 * amp_max, amp_max, size=nu)
 
     #another option of initially sampling amplitudes
-    a = rng.uniform(0.3 * amp_max, amp_max, size=nu)
+    # a = rng.uniform(0.3 * amp_max, amp_max, size=nu)
+    a = RNG.uniform(0.10 * amp_max, 0.45 * amp_max, size=nu)    # was 0.3..1.0*amp_max
 
 
     # phi = rng.uniform(0.0, 2 * np.pi, size=nu)
     # NEW: alternate 0 / π across actuators to encourage left–right symmetry
     phi = np.where(np.arange(nu) % 2 == 0, 0.0, np.pi)
-    phi = (phi + rng.uniform(-0.25, 0.25, size=nu)) % (2 * np.pi)
 
+    #phi = (phi + rng.uniform(-0.25, 0.25, size=nu)) % (2 * np.pi)
+    phi = (phi + RNG.uniform(-0.20, 0.20, size=nu)) % (2*np.pi)
 
-    b = rng.uniform(-0.1, 0.1, size=nu)
+    # b = rng.uniform(-0.1, 0.1, size=nu)
+    b = RNG.uniform(-0.06, 0.06, size=nu)
+
     # omega = rng.uniform(1.5, 4.0, size=1)  # Hz-ish (scaled by Mujoco time)
-    omega = rng.uniform(1.2, 4.5, size=nu)  # per joint
+    #omega = rng.uniform(1.2, 4.5, size=nu)  # per joint
+    omega = RNG.uniform(0.8, 3.0, size=nu) 
+   
+
+
     
     return np.concatenate([a, phi, b, omega]).astype(np.float64)
 
@@ -425,32 +433,42 @@ def evaluate_cpg_multi_spawn(
     duration: int,
     spawns: list[list[float]] = SPAWN_LIST,
 ) -> tuple[float, list[list[float]], float]:
+    
     """
-    Returns (agg_fitness, best_history, best_x_end).
-    Aggregates fitness as mean across spawns; returns the history of the best spawn
-    (handy for plotting). best_x_end is the max end-x reached across spawns, used for schedule.
+    Returns (agg_fitness, best_history, best_x_end, best_x_time).
+    - agg_fitness: mean shaped fitness across spawns
+    - best_history: the history of the best spawn (by shaped fitness)
+    - best_x_end:   max of final x across spawns
+    - best_x_time:  max of *max x during episode* across spawns  <-- use for curriculum
     """
-    fits, histories, xends = [], [], []
+    fits, histories, x_end_list, x_time_list = [], [], [], []
+    #fits, histories, xends = [], [], []
     best_idx, best_fit = 0, -np.inf
     for i, s in enumerate(spawns):
         # Run one episode from a given spawn
-        f_raw, _, _, h = rollout_cpg_on_session(session, params, duration=duration, spawn_pos=s) #step 5 of phase A
+        _, _, _, h = rollout_cpg_on_session(session, params, duration=duration, spawn_pos=s) # change 6
+        #f_raw, _, _, h = rollout_cpg_on_session(session, params, duration=duration, spawn_pos=s) #step 5 of phase A
         # f, _, _, h = rollout_cpg_on_session(session, params, duration=duration, spawn_pos=s) step 4 of phase A
 
         # Replace raw fitness with shaped fitness during training step 5 of phase A
         dt = float(session.model.opt.timestep)
         f = training_fitness_from_history(h, dt, TARGET_POSITION[0])
 
+        arr = np.asarray(h, dtype=np.float64)
+        xs = arr[:, 0]
+        x_end_list.append(float(xs[-1]))
+        x_time_list.append(float(np.max(xs)))
+
         fits.append(f)
         histories.append(h)
-        xends.append(h[-1][0])
         if f > best_fit:
             best_fit, best_idx = f, i
 
     agg_fit = float(np.mean(fits))
     best_hist = histories[best_idx]
-    best_x_end = float(np.max(xends))
-    return agg_fit, best_hist, best_x_end
+    best_x_end = float(np.max(x_end_list))
+    best_x_time = float(np.max(x_time_list))
+    return agg_fit, best_hist, best_x_end, best_x_time
 
 
 def play_viewer_on_session(session: SimSession, cpg_params: np.ndarray) -> None:
@@ -536,13 +554,13 @@ def record_video_on_session(
 
 # ---------- CPG param bounds & clipping ----------
 def _cpg_bounds(nu: int):
-    amp_max = np.pi / 2 * 0.9
+    amp_max = np.pi / 2 * 0.6  #0.9
     return {
         "a":   (np.zeros(nu),            np.full(nu, amp_max)),
         "phi": (np.zeros(nu),            np.full(nu, 2 * np.pi)),
         "b":   (np.full(nu, -np.pi/4),   np.full(nu,  np.pi/4)),
         # "omega": (np.array([0.5]),       np.array([6.0])),
-        "omega": (np.full(nu, 0.6), np.full(nu, 6.0))
+        "omega": (np.full(nu, 0.6), np.full(nu, 3.5))
     }
 
 def _clip_cpg_params(theta: np.ndarray, nu: int) -> np.ndarray:
@@ -559,6 +577,20 @@ def _clip_cpg_params(theta: np.ndarray, nu: int) -> np.ndarray:
 
     return out
 # -------------------------------------------------
+
+def prescreen_random_params(session: SimSession, n:int=40, duration:int=12) -> np.ndarray:
+    nu = session.model.nu
+    best_theta, best_score = None, -np.inf
+    for _ in range(n):
+        theta = _clip_cpg_params(_sample_cpg_params(nu, RNG), nu)
+        f, h, _, _ = evaluate_cpg_multi_spawn(session, theta, duration=duration, spawns=[SPAWN_FLAT])
+        if f > best_score:
+            best_score, best_theta = f, theta
+    return best_theta
+
+# In es_train_cpg_on_body, after creating 'session':
+parent = prescreen_random_params(session, n=40, duration=12)
+
 
 # ---------- (1+λ)-ES trainer for CPG ----------
 def es_train_cpg_on_body(
@@ -589,8 +621,12 @@ def es_train_cpg_on_body(
     parent = _clip_cpg_params(parent, nu)
 
     # best_fit, _, _, best_hist = rollout_cpg_on_session(session, parent, duration=15)
-    best_fit, best_hist, best_x = evaluate_cpg_multi_spawn(session, parent, duration=150)
-    best_x = float(best_hist[-1][0])
+    # best_fit, best_hist, best_x = evaluate_cpg_multi_spawn(session, parent, duration=45)
+
+    # best_x = float(best_hist[-1][0])
+
+    best_fit, best_hist, best_x_end, best_x_time = evaluate_cpg_multi_spawn(session, parent, duration=45)
+    best_x = best_x_time  # use max progress during episode
     success = 0
 
     # Save meta once
@@ -606,21 +642,51 @@ def es_train_cpg_on_body(
         active_spawns = curriculum_spawns(best_x)  # NEW
         # fit_p, _, _, hist_p = rollout_cpg_on_session(session, parent, duration=dur)
         # fit_p, hist_p, best_x_p = evaluate_cpg_multi_spawn(session, parent, duration=dur)
-        fit_p, hist_p, best_x_p = evaluate_cpg_multi_spawn(session, parent, duration=dur, spawns=active_spawns)
+        #fit_p, hist_p, best_x_p = evaluate_cpg_multi_spawn(session, parent, duration=dur, spawns=active_spawns)
+        fit_p, hist_p, x_end_p, x_time_p = evaluate_cpg_multi_spawn(session, parent, duration=dur, spawns=active_spawns)
+
 
         cand_best_fit = fit_p
         cand_best_theta = parent
         cand_best_hist = hist_p
 
-        for _ in range(lam):
-            child = parent + sigma * rng.normal(size=parent.shape)
-            child = _clip_cpg_params(child, nu)
-            # fit_c, _, _, hist_c = rollout_cpg_on_session(session, child, duration=dur)
-            # fit_c, hist_c, _ = evaluate_cpg_multi_spawn(session, child, duration=dur)
-            fit_c, hist_c, _ = evaluate_cpg_multi_spawn(session, child, duration=dur, spawns=active_spawns)
+        # for _ in range(lam):
+        #     child = parent + sigma * rng.normal(size=parent.shape)
+        #     child = _clip_cpg_params(child, nu)
+        #     # fit_c, _, _, hist_c = rollout_cpg_on_session(session, child, duration=dur)
+        #     # fit_c, hist_c, _ = evaluate_cpg_multi_spawn(session, child, duration=dur)
+        #     # fit_c, hist_c, _ = evaluate_cpg_multi_spawn(session, child, duration=dur, spawns=active_spawns)
+        #     # fit_c, hist_c, _, _ = evaluate_cpg_multi_spawn(session, child, duration=dur, spawns=active_spawns)
+    
 
+        #     if fit_c > cand_best_fit:
+        #         cand_best_fit, cand_best_theta, cand_best_hist = fit_c, child, hist_c
+
+        # --- antithetic sampling: evaluate +eps and -eps pairs ---
+        half = lam // 2
+        eps_list = [rng.normal(size=parent.shape) for _ in range(half)]
+
+        for eps in eps_list:
+            for sign in (+1.0, -1.0):
+                child = parent + sign * sigma * eps
+                child = _clip_cpg_params(child, nu)
+                # If your evaluate returns 3 values:
+                fit_c, hist_c, _ = evaluate_cpg_multi_spawn(session, child, duration=dur, spawns=active_spawns)
+                # If you already updated evaluate to return 4 values (with max-x-time), use:
+                # fit_c, hist_c, _, _ = evaluate_cpg_multi_spawn(session, child, duration=dur, spawns=active_spawns)
+
+                if fit_c > cand_best_fit:
+                    cand_best_fit, cand_best_theta, cand_best_hist = fit_c, child, hist_c
+
+        # optional: if lam is odd, do one extra (+eps) sample
+        if lam % 2 == 1:
+            eps = rng.normal(size=parent.shape)
+            child = parent + sigma * eps
+            child = _clip_cpg_params(child, nu)
+            fit_c, hist_c, _ = evaluate_cpg_multi_spawn(session, child, duration=dur, spawns=active_spawns)
             if fit_c > cand_best_fit:
                 cand_best_fit, cand_best_theta, cand_best_hist = fit_c, child, hist_c
+        # --- end antithetic block ---
 
         improved = cand_best_fit > fit_p
         if improved:
@@ -634,8 +700,10 @@ def es_train_cpg_on_body(
             np.save(run_dir / "best_hist.npy", np.asarray(best_hist))
 
 
-        #best_x = max(best_x, float(hist_p[-1][0]))
-        best_x = max(best_x, best_x_p)
+        # best_x = max(best_x, float(hist_p[-1][0]))
+        # best_x = max(best_x, best_x_p)
+        best_x = max(best_x, x_time_p)   # gate on max progress, not end
+
 
         if g % 5 == 0:
             rate = success / 5.0
@@ -660,7 +728,7 @@ def es_train_cpg_on_body(
 def experiment(
     robot: Any,
     controller: Controller,
-    duration: int = 15,
+    duration: int = 45,
     mode: ViewerTypes = "viewer",
 ) -> None:
     """Run the simulation with random movements."""
@@ -786,7 +854,7 @@ def main() -> None:
     # Train the CPG params on Gecko step 3 of phase A
     best_params, best_fit, best_hist, session, run_dir = es_train_cpg_on_body(
         core,
-        iters=50,      # before it was 28, you can increase later
+        iters=60,      # before it was 28, you can increase later
         lam=24,        # before it was 12
         sigma=0.25,    # a bit bolder; your 1/5th rule will adapt it (before it was 0.25 )
         seed=SEED,
@@ -872,3 +940,4 @@ def main() -> None:
     # console.log(msg)
 if __name__ == "__main__":
     main()
+
