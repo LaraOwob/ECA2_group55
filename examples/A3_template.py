@@ -160,7 +160,7 @@ def experiment(
     # ==================================================================== #
     # Initialise controller to controller to None, always in the beginning.
     mj.set_mjcb_control(None)  # DO NOT REMOVE
-
+    
     # Initialise world
     # Import environments from ariel.simulation.environments
     world = OlympicArena()
@@ -181,7 +181,7 @@ def experiment(
     # Count hinge joints
     hinge_indices = np.where(model.jnt_type == mj.mjtJoint.mjJNT_HINGE)[0]
     num_hinges = len(hinge_indices)
-
+    qacc_fitness  = None
     # Count blocks (bodies)
     # Exclude the world body (index 0) if you only want the robot parts
     num_blocks = model.nbody - 1  
@@ -190,12 +190,13 @@ def experiment(
     print("Number of blocks (bodies) used:", num_blocks)
     if num_hinges < 3 or num_blocks < 3:
         print("insufficient body")
-        return None
+        qacc_fitness = 0
+        return None, qacc_fitness
     
     # Pass the model and data to the tracker
     if controller.tracker is not None:
         controller.tracker.setup(world.spec, data)
-
+    
     # Set the control callback function
     # This is called every time step to get the next action.
     args: list[Any] = []  # IF YOU NEED MORE ARGUMENTS ADD THEM HERE!
@@ -262,23 +263,20 @@ def experiment(
                     np.any(np.isinf(data.qacc)) or
                     np.any(np.abs(data.qacc) > 12000)):
                     print("Unstable simulation detected! Aborting timestep mode.", max(np.abs(data.qacc)))
-                    unstable = True
-                    break
+                    return None, max(np.abs(data.qacc))
                 #if np.any(np.abs(data.qacc) > maxQacc):
                  #   maxQacc =max(np.abs(data.qacc))
                   #  print(maxQacc)
 
-            if unstable:
-                # Optionally: return early with zero distance or a flag
-                return None
+           
      # ✅ After simulation — record end position
     end_position = np.copy(data.qpos[:2])  # final x,y
 
     # ✅ Compute Euclidean distance travelled
     distance = np.linalg.norm(end_position - start_position)
-
+    
     # Return the scalar distance
-    return distance
+    return distance, qacc_fitness
 
 
 
@@ -314,23 +312,32 @@ def makeBody(num_modules: int = 20, genotype=None, simulation = "timestep", dura
         # controller_callback_function=random_move,
         tracker=tracker,
     )
-    distance = experiment(robot=core, controller=ctrl, mode=simulation,duration = duration)
-    if distance ==None:
-        return None
+    distance, weirdfitness = experiment(robot=core, controller=ctrl, mode=simulation,duration = duration)
+    if weirdfitness:
+        print("got weird fitness")
+        return core,weirdfitness
     else:
         WORKING_BODIES.add(core)
-        return core
+        return core, None
 
 
-def makeIndividual(body,genotype):
+def makeIndividual(body,genotype,QACC_fitness):
     #Create a body
     #Spawn core to get model, for nu
-    if body == None:
-        individual ={
+    if QACC_fitness:
+        if QACC_fitness == 0:
+            individual ={
                 "genotype": genotype,
                 "robot_spec": body,
                 "nn": None,
-                "fitness": 1.5
+                "fitness": 100
+            }
+        else:
+            individual ={
+                "genotype": genotype,
+                "robot_spec": body,
+                "nn": None,
+                "fitness": QACC_fitness / 10000
             }
         return individual
     else:
@@ -351,24 +358,7 @@ def makeIndividual(body,genotype):
             }
        
         return individual
-    
-    
-def is_genotype_valid(genotype):
-    # e.g., check number of hinges
-    num_modules =20
-    nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
-    p_matrices = nde.forward(genotype)
-    hpd = HighProbabilityDecoder(num_modules)
-    robot_graph = hpd.probability_matrices_to_graph(p_matrices[0], p_matrices[1], p_matrices[2])
-    no_hinges = sum(1 for joint in robot_graph['joints'] if joint['type'] == 'hinge')
-    no_bodies = len(robot_graph['bodies'])
-    if no_hinges == 0:
-        return False
-    if no_bodies< 3:
-        return False
-    return True
-
-
+ 
 def flatten_genotype(genotype):
     """Flatten the genotype (3 vectors of size 64) into a single 192-element vector."""
     return np.concatenate(genotype)
@@ -399,11 +389,10 @@ def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5):
         for g in range(generations):
             solutions = es.ask()
             fitnesses = []
-            print(f"this is generation {g} \n\n\n")
             for sol in solutions:
                 genotype = unflatten_genotype(np.clip(sol, 0.1, 0.9).astype(np.float32))
-                body = makeBody(num_modules=20, genotype=genotype)
-                individual = makeIndividual(body, genotype)
+                body,Qacc_fitness = makeBody(num_modules=20, genotype=genotype)
+                individual = makeIndividual(body, genotype,Qacc_fitness)
                 fitness = individual["fitness"]
                 fitnesses.append(fitness) 
                 if fitness < best_fit:
@@ -416,7 +405,6 @@ def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5):
             gen_mean = float(np.mean(fitnesses))
             gen_median = float(np.median(fitnesses))
             writer.writerow([g, gen_best, gen_mean, gen_median])
-    print("finished")
     return best_candidate, best_fit
 
 
@@ -430,10 +418,8 @@ def TrainDummyNet(nn_obj): #(nn_obj: NNController):
 def plot(file_path,output_path):
         # --- Load your results file ---
     # Works for both .csv and .xlsx
-    print(file_path)
     file_path = str(file_path)
     if file_path.endswith(".csv"):
-        print("its csv")
         df = pd.read_csv(file_path)
     else:
         df = pd.read_excel(file_path)
@@ -463,11 +449,11 @@ def plot(file_path,output_path):
     
     
     
-def main(action, generations = 300, pop_size = 150):
+def main(action, generations = 30, pop_size = 10):
     file_path =  f"MLP_CMAES_{generations}_{pop_size}_results.csv"
     if action == "algorithm":
         
-        print("Starting evolutionary algorithm...")
+        print(f"Starting evolutionary algorithm with {generations} generations and population {pop_size}...")
         start_cmaes = time.time()
         best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=str(DATA /file_path ), generations=generations, pop_size=pop_size, seed=SEED)
         end_cmaes = time.time()
