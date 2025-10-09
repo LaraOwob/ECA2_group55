@@ -449,7 +449,7 @@ def plot(file_path,output_path):
     
     
     
-def main(action, generations = 30, pop_size = 10):
+def main(action, generations = 100, pop_size = 10):
     file_path =  f"MLP_CMAES_{generations}_{pop_size}_results.csv"
     if action == "algorithm":
         
