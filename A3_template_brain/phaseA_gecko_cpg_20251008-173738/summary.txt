@@ -1,0 +1,2 @@
+final_fit=-4.364058
+reached=False
