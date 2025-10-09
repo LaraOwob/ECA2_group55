@@ -82,8 +82,6 @@ DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(exist_ok=True)
 
 CTRL_RANGE = 1.0
-BODY_COLLECTION = {}
-BEST_FITNESS= 0
 WORKING_BODIES =set()
 # ----------------------------
 # Neural Network Controller
@@ -409,6 +407,121 @@ def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5):
     return best_candidate, best_fit
 
 
+
+
+
+def makeGenotype(num_modules: int = 20):
+    genotype_size = 64
+    type_p = RNG.random(genotype_size).astype(np.float32)
+    conn_p = RNG.random(genotype_size).astype(np.float32)
+    rot_p = RNG.random(genotype_size).astype(np.float32)
+    genotype = [type_p, conn_p, rot_p]
+    return genotype
+
+
+def initializePopulation(pop_size: int = 10, num_modules: int = 20):
+    # add unique bodies to the population
+    population = []
+    all_fitness = []
+    for _ in range(pop_size):
+        genotype = makeGenotype(num_modules)
+        body,Qacc_fitness = makeBody(num_modules=20, genotype=genotype)
+        individual = makeIndividual(body, genotype,Qacc_fitness)
+        all_fitness.append(individual["fitness"])
+        population.append(individual)
+        
+    return population, all_fitness
+
+
+
+def mutation(a,b,c,F):
+    #mutant = pop[a] + F * (pop[b] - pop[c])
+    mutant_genotye = [np.zeros(64)]*3
+    for vector in range(3):
+        for gene in range(64):
+            difference = b[vector][gene] - c[vector][gene]
+            mutant_genotye[vector][gene] = a[vector][gene] + F * difference
+    return mutant_genotye
+
+def crossover(parent, mutant, CR, vector_size=3, gene_size=64):
+    """
+    Make a crossover between the parent and the mutant per vector
+    so that each vector has at least one gene from the mutant
+    
+    """
+    rng = np.random.default_rng(SEED)
+    crossover_genotype =[]
+    for i in range(vector_size):
+        cross = rng.random(gene_size) < CR
+        cross[rng.integers(0, gene_size)] = True 
+        trial_vector = np.where(cross, mutant[i], parent[i])
+        crossover_genotype.append(trial_vector)
+    
+    return crossover_genotype
+
+
+#  Differential Evolution on MLP (1b)
+def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=None, data=None, core_bind=None,
+                 hidden=32, freq_hz=1.0, F=0.7, CR=0.9, init_scale=0.5, alpha=0.2):
+    """
+    Simple, Differential Evolution for MLP parameters.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Initialize population by sampling normal distribution with mean 0 and stdv of init_scale
+    pop,fits = initializePopulation(pop_size=pop_size, num_modules=20)
+    print("made population")
+    #Finds best fitnesses
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    best_idx = int(np.argmin(fits))
+    best_candidate = pop[best_idx].copy()
+    best_fit = float(fits[best_idx])
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["generation", "best_fitness", "mean_fitness", "median_fitness"])
+        for g in range(generations):
+            for i in range(pop_size):
+                #Select all indices expcept for i, the candidate you want to mutate
+                choices = []
+                for index in range(pop_size):
+                    if index != i:
+                        choices.append(index)
+                #Out of valid choices, choose 3 random candidates 
+                a, b, c = rng.choice(choices, size=3, replace=False)
+                #Mutant candidate:
+                mutant = mutation(pop[a]["genotype"],pop[b]["genotype"],pop[c]["genotype"],F)
+                trial = crossover(pop[i]["genotype"], mutant, CR, vector_size=3, gene_size=64)
+                # Evaluate trial
+                trialbody,Qacc_fitness = makeBody(num_modules=20, genotype=trial)
+                trialindividual = makeIndividual(trialbody, trial,Qacc_fitness)
+                f_trial = trialindividual["fitness"] #fitness is negative distance to target
+
+                # If trial is better than parent than trial enters population
+                if f_trial <= fits[i]:
+                    pop[i] = trialindividual
+                    fits[i] = f_trial
+
+            # Retrieve stats: best fitness, mean fitness and median fitness and write to csv
+            gen_best = float(np.min(fits))
+            gen_mean = float(np.mean(fits))
+            gen_median = float(np.median(fits))
+            writer.writerow([g, gen_best, gen_mean, gen_median])
+
+            # Update and check best candidate with best fitness
+            if gen_best < best_fit:
+                best_fit = gen_best
+                best_candidate = pop[int(np.argmin(fits))].copy()
+
+            #Print every after every 10th generation
+            #if (g + 1) % max(1, generations // 10) == 0:
+                #print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
+
+    return best_candidate, best_fit
+
+
+
+
 def TrainDummyNet(nn_obj): #(nn_obj: NNController):   
     RNG = np.random.default_rng(SEED)  # No fixed seed
     fitness = RNG.random()
@@ -503,25 +616,45 @@ def plot_experiment(exp_name, exp_csvs, final_exp ,out_png, window=10, title=Non
 
 
     
-def main(action, generations = 25, pop_size = 10, seed = [0,1,2]):
-    
-    if action == "algorithm":
+def main(action, generations = 100, pop_size = 30, seed = [0,1,2]):
+    global WORKING_BODIES
+    if action == "CMAES":
+        WORKING_BODIES = set()
         best_candidate_CMAES = None
         for s in seed:
             file_path =  f"./results/CMAES/CMAES_{generations}_{pop_size}_seed{s}.csv"
-            print(f"Starting evolutionary algorithm with {generations} generations and population {pop_size} and seed {s}...")
+            print(f"Starting CMAES algorithm with {generations} generations and population {pop_size} and seed {s}...")
             start_cmaes = time.time()
             best_candidate_CMAES, best_fit_CMAES = train_mlp_cmaes(out_csv=file_path, generations=generations, pop_size=pop_size, seed=s)
             end_cmaes = time.time()
             print(f"Seed {s}")
-            print("Best CMAE candidate fitness:", best_fit_CMAES)
+            print("Best CMAES candidate fitness:", best_fit_CMAES)
             print("CMAES Time:", end_cmaes - start_cmaes)
             #simulate core quickly to see if it is feasible
             print(f"CMAES found {len(WORKING_BODIES)} bodies in total \n\n\n")
         if best_candidate_CMAES["robot_spec"]:
             print("find a body")
             makeBody(genotype = best_candidate_CMAES["genotype"], simulation = "launcher", duration = 15)
-    if action == "plot":
+    
+    if action == "DE":
+        WORKING_BODIES = set()
+        best_candidate_CMAES = None
+        for s in seed:
+            file_path =  f"./results/DE/DE{generations}_{pop_size}_seed{s}.csv"
+            print(f"Starting DE algorithm with {generations} generations and population {pop_size} and seed {s}...")
+            start_de = time.time()
+            best_candidate_DE, best_fit_DE = train_mlp_de(out_csv=file_path, generations=generations, pop_size=pop_size, seed=s)
+            end_de = time.time()
+            print(f"Seed {s}")
+            print("Best DE candidate fitness:", best_fit_DE)
+            print("DE Time:", end_de - start_de)
+            #simulate core quickly to see if it is feasible
+            print(f"DE found {len(WORKING_BODIES)} bodies in total \n\n\n")
+        if best_candidate_DE["robot_spec"]:
+            print("find a body")
+            makeBody(genotype = best_candidate_DE["genotype"], simulation = "launcher", duration = 15)
+            
+    if action == "plot CMAES":
         exp_csvs = sorted(glob.glob(f"./results/CMAES/CMAES_{generations}_{pop_size}_seed*.csv"))
         print(exp_csvs)
         plot_experiment(exp_name = "CMAES",
@@ -530,14 +663,18 @@ def main(action, generations = 25, pop_size = 10, seed = [0,1,2]):
                         out_png=f"./results/plotsA3/CMAES_{generations}_{pop_size}.png",
                         window=10,
                         title="fitness of CMAES over generations")
-        #csv_path = DATA / file_path
-        #print(f"Looking for file at: {csv_path.resolve()}")
-
-        #output_path = "plot_" + file_path[:-4] + ".png"
-        #plot((DATA / file_path),output_path)
-            
+    if action == "plot DE":
+        exp_csvs = sorted(glob.glob(f"./results/DE/DE{generations}_{pop_size}_seed*.csv"))
+        print(exp_csvs)
+        plot_experiment(exp_name = "DE",
+                        exp_csvs=exp_csvs,
+                        final_exp=False,
+                        out_png=f"./results/plotsA3/DE{generations}_{pop_size}.png",
+                        window=10,
+                        title="fitness of DE over generations")
+  
             
 if __name__ == "__main__":
-    action = "plot" # 'plot' or 'algorithm'
+    action = "plot DE" # 'plot CMAES', 'plot DE', 'DE', 'CMAES'
     main(action)
     
