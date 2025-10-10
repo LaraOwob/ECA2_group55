@@ -7,91 +7,86 @@ Todo:
 """
 
 # Standard library
-import datetime
 import math
+from pathlib import Path
 
 # Third-party libraries
 import mujoco
 from PIL import Image
-from rich.console import Console
 
 # Local libraries
+from ariel import log
+from ariel.utils.file_ops import generate_save_path
 from ariel.utils.video_recorder import VideoRecorder
-
-# Global functions
-console = Console()
 
 
 def single_frame_renderer(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     steps: int = 10,
+    width: int = 480,
+    height: int = 640,
+    fovy: float = 7,
     *,
+    show: bool = False,
     save: bool = False,
-    save_path: str | None = None,
-    append_date: bool = True,
-) -> None:
-    """
-    Render a single frame of the simulation using MuJoCo's rendering engine.
+    save_path: str | Path | None = None,
+) -> Image.Image:
+    # Reset state and time of simulation
+    mujoco.mj_resetData(model, data)
 
-    Parameters
-    ----------
-    model : mujoco.MjModel
-        The MuJoCo model to render.
-    data : mujoco.MjData
-        The MuJoCo data to render.
-    steps : int, optional
-        The number of simulation steps to take before rendering, by default 10
-    """
     # Enable joint visualization option:
     scene_option = mujoco.MjvOption()
     scene_option.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = True
 
-    # Reset state and time of simulation
-    mujoco.mj_resetData(model, data)
-
     # Call rendering engine
-    msg = f"Rendering single frame with [bold blue] {steps} [/bold blue] steps."
-    console.log(f"[bold yellow] --> {msg} [/bold yellow]")
-    with mujoco.Renderer(model) as renderer:
+    with mujoco.Renderer(
+        model,
+        width=width,
+        height=height,
+    ) as renderer:
         # Move simulation forward one iteration/step
         mujoco.mj_step(model, data, nstep=steps)
 
         # Update rendering engine
+        camera = mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_CAMERA,
+            "ortho-cam",
+        )
+
+        # If camera not found, use default camera
+        if camera == -1:
+            log.debug("Camera 'ortho-cam' not found. Using default camera.")
+            camera = None
+        else:
+            model.cam_fovy[camera] = fovy
+
+        # Update the renderer's camera
         renderer.update_scene(
             data,
             scene_option=scene_option,
+            camera=camera,
         )
 
         # Generate frame using rendering engine
         frame = renderer.render()
 
         # Convert frame into an image which can be shown
-        img = Image.fromarray(frame)
+        img: Image.Image = Image.fromarray(frame)
 
-        # Save or show
-        if save is True:
-            # No save path given (use default)
-            if save_path is None:
-                save_path = "./frame.png"
+    # Save image locally
+    if save is True:
+        if save_path is None:
+            save_path = generate_save_path(file_path="img.png")
+        img.save(save_path, format="png")
 
-            # Add date to name
-            if append_date is True:
-                now = datetime.datetime.now(tz=datetime.UTC)
-                date = now.strftime("%Y-%m-%d_%H-%M-%S")
-                file_format = save_path.split(".")[-1]
+    # Show image
+    if show is True:
+        img.show()
 
-                # Update file name
-                save_path = save_path[: -(len(file_format) + 1)]
-                save_path += f"_{date}"
-                save_path += f".{file_format}"
-
-            # Save image locally
-            img.save(save_path, format="png")
-        else:
-            img.show()
-
-    console.log("[bold green] --> Rendering done![/bold green]")
+    # Return image
+    return img
 
 
 def video_renderer(
@@ -105,13 +100,13 @@ def video_renderer(
 
     Parameters
     ----------
-    model : mujoco.MjModel
+    model
         The MuJoCo model to render.
-    data : mujoco.MjData
+    data
         The MuJoCo data to render.
-    duration : float, optional
+    duration
         The duration of the video in seconds, by default 10.0
-    video_recorder : VideoRecorder | None, optional
+    video_recorder
         The video recorder to use, by default None
     """
     # Get video recorder
@@ -148,7 +143,9 @@ def video_renderer(
             video_recorder.write(frame=renderer.render())
 
     # Exit (and save locally) the generated video
-    console.log(video_recorder.frame_count)
+    msg = "Finish video rendering"
+    num_frames = video_recorder.frame_count
+    log.info(f"--> {msg}: {num_frames=}")
     video_recorder.release()
 
 
@@ -157,28 +154,32 @@ def tracking_video_renderer(
     data: mujoco.MjData,
     duration: float = 10.0,
     video_recorder: VideoRecorder | None = None,
+    geom_to_track: str = "robot-core",
     tracking_distance: float = 1.5,
-    tracking_angle: float = 135,
+    tracking_azimuth: float = 135,
+    tracking_elevation: float = -30,
 ) -> None:
     """
     Render a video of the simulation with camera tracking the "core" module.
 
     Parameters
     ----------
-    model : mujoco.MjModel
+    model
         The MuJoCo model to render.
-    data : mujoco.MjData
+    data
         The MuJoCo data to render.
-    duration : float, optional
+    duration
         The duration of the video in seconds, by default 10.0
-    video_recorder : VideoRecorder | None, optional
+    video_recorder
         The video recorder to use, by default None
-    tracking_distance : float, optional
-        Distance from the core module for camera positioning, by default 1.5
-    tracking_angle : float, optional
-        Angle relative to the robot that the camera will be recording from.
-        By default 135, meaning the robot will walk to the left. If set to 0
-        the robot will walk towards the camera.
+    geom_to_track
+        The name of the body to track, by default "robot-core"
+    tracking_distance
+        The distance of the camera from the body, by default 1.5
+    tracking_azimuth
+        The azimuth angle of the camera, by default 135
+    tracking_elevation
+        The elevation angle of the camera, by default -30
     """
     # Get video recorder
     if video_recorder is None:
@@ -196,26 +197,20 @@ def tracking_video_renderer(
         core_body_id = mujoco.mj_name2id(
             model,
             mujoco.mjtObj.mjOBJ_BODY,
-            "robot-core",
+            geom_to_track,
         )
-        console.log(f"Tracking core body ID: {core_body_id}")
+        msg = f"Tracking core body ID: {core_body_id}"
+        log.info(msg)
     except ValueError:
-        # Fallback: try to find any body with "core" in the name
+        msg = f"Body name '{geom_to_track}' not found in the model."
+        msg += " Using default camera."
+        log.warning(msg)
         core_body_id = None
         for i in range(model.nbody):
             body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)
             if body_name and "core" in body_name:
                 core_body_id = i
                 break
-
-    if core_body_id is None:
-        console.log(
-            "[bold red] --> Warning: No core body found for tracking. Using default camera.[/bold red]",
-        )
-    else:
-        console.log(
-            f"[bold blue] --> Tracking core body with ID: {core_body_id}[/bold blue]",
-        )
 
     # Calculate steps per frame to avoid single iterations
     options = mujoco.MjOption()
@@ -229,45 +224,35 @@ def tracking_video_renderer(
         width=video_recorder.width,
         height=video_recorder.height,
     ) as renderer:
-        # Set up tracking camera if core body found
-        if core_body_id is not None:
-            # Create a tracking camera
-            camera = mujoco.MjvCamera()
-            camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-            camera.trackbodyid = core_body_id
-            camera.distance = tracking_distance
-            camera.azimuth = tracking_angle  # Angle around the target
-            camera.elevation = -30.0  # Angle above/below the target
-
-            # Update the renderer's camera
-            renderer.update_scene(
-                data,
-                scene_option=scene_option,
-                camera=camera,
-            )
-        else:
-            # Use default camera
-            renderer.update_scene(data, scene_option=scene_option)
-
         while data.time < duration:
             # Move simulation forward one iteration/step
             mujoco.mj_step(model, data, nstep=math.floor(steps_per_frame))
 
-            # Update rendering engine with tracking camera
+            # Set up tracking camera if core body found
             if core_body_id is not None:
+                # Create a tracking camera
+                camera = mujoco.MjvCamera()
+                camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                camera.trackbodyid = core_body_id
+                camera.distance = tracking_distance
+                camera.azimuth = tracking_azimuth
+                camera.elevation = tracking_elevation
+
+                # Update the renderer's camera
                 renderer.update_scene(
                     data,
                     scene_option=scene_option,
                     camera=camera,
                 )
             else:
+                # Use default camera
                 renderer.update_scene(data, scene_option=scene_option)
 
             # Save frame
             video_recorder.write(frame=renderer.render())
 
     # Exit (and save locally) the generated video
-    console.log(
-        f"[bold green] --> Tracking video rendered with {video_recorder.frame_count} frames[/bold green]"
-    )
+    msg = "Finish video rendering"
+    num_frames = video_recorder.frame_count
+    log.info(f"[bold green] --> {msg} [/bold green]: {num_frames=}")
     video_recorder.release()

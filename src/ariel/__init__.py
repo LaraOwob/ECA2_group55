@@ -1,15 +1,42 @@
-"""Ariel."""
+"""
+ARIEL: Autonomous Robots through Integrated Evolution and Learning.
+
+Todo
+----
+    [ ] Make rich logger take command-line argument for verbosity  (click?)
+"""
 
 # Standard library
+import logging
 from pathlib import Path
 
-# Pretty errors and console output
+# Third-party libraries
+import numpy as np
+from rich.console import Console
+from rich.logging import RichHandler
 from rich.traceback import install
 
-# Produce data output folder
+# --- DATA SETUP --- #
 CWD = Path.cwd()
 DATA = Path(CWD / "__data__")
-DATA.mkdir(exist_ok=True)
 
-# Colorful errors
+# --- RANDOM GENERATOR SETUP --- #
+SEED = 42
+RNG = np.random.default_rng(SEED)
+
+# --- TERMINAL OUTPUT SETUP --- #
+FORMAT = "%(message)s"
 install()
+console = Console()
+logging_level = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+logging.basicConfig(
+    level=logging_level,
+    format=FORMAT,
+    datefmt="[%X]",
+    handlers=[
+        RichHandler(
+            rich_tracebacks=True,
+        ),
+    ],
+)
+log = logging.getLogger("rich")
