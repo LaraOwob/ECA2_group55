@@ -329,7 +329,7 @@ def makeIndividual(body,genotype,QACC_fitness):
                 "genotype": genotype,
                 "robot_spec": body,
                 "nn": None,
-                "fitness": 100
+                "fitness": 10
             }
         else:
             individual ={
