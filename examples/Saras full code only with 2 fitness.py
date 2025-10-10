@@ -28,7 +28,7 @@ SEED = 42
 RNG = np.random.default_rng(SEED)
 CTRL_RANGE = 1.0
 
-SPAWN_POS = [2.8 , -0.2, 0.1]
+SPAWN_POS = [3 , -0.2, 0.1]
 TARGET_POS = np.array([5.0, 0.0, 0.5], dtype=np.float32)
 DURATION = 8.0
 
@@ -220,12 +220,6 @@ def evaluateFitness(model: mj.MjModel,
     x_mid = 0.5 * (xs[1:] + xs[:-1])
 
 
-    # --- hill-aware speed scaling (hard cutoff) ---
-    if np.any(xs >= x_rugged_end):
-        w_speed_eff = w_speed * 0.6
-    else:
-        w_speed_eff = 0
-
     # only credit progress when near ground (reduce "flying" exploits)
     near_ground = (zs[:-1] <= z0 + 0.15)   # slightly tighter gate
     credited_dx = np.clip(dx, 0.0, None) * near_ground.astype(float)
@@ -243,6 +237,7 @@ def evaluateFitness(model: mj.MjModel,
     finish_bonus = w_finish if finished else 0.0
     speed_bonus = 0.0
     if finished:
+        print('finish')
         idx_finish = int(np.argmax(xs >= x_finish))
         t_finish = (idx_finish / max(1, (len(xs) - 1))) * duration
         speed_bonus = w_speed * max(0.0, (duration - t_finish) / duration)
@@ -250,17 +245,10 @@ def evaluateFitness(model: mj.MjModel,
 
     # --- climb bonus (small) ---
      # --- climb bonus ---
-    heigth_loss_pen = 0
+    if start_x >= x_rugged_end:
+        w_climb = 0.8
+
     climb_bonus = w_climb * max(0.0, (zT - z0))
-    if xT >= x_rugged_end:
-        target_z = target_pos[2] # example target height (you can pass as argument)
-        z_diff = target_z - z0
-        z_gain = zT - z0
-        z_ratio = np.clip(z_gain / max(1e-6, z_diff), 0.0, 1.0)
-
-# reward increases as it reaches target_z
-        reward_uphill = w_climb * z_ratio
-
 
     # dt = duration / max(1, len(xs) - 1)
     # vx = np.diff(xs) / dt
@@ -310,9 +298,8 @@ def evaluateFitness(model: mj.MjModel,
     # --- final score ---
     fitness = (
         progress + finish_bonus + speed_bonus + climb_bonus + 
-        #hill_speed_bonus + 
         yaw_align
-        - lateral_pen - latvel_pen - back_pen - fall_pen - floor_pen - oob_pen - heigth_loss_pen
+        - lateral_pen - latvel_pen - back_pen - fall_pen - floor_pen - oob_pen 
     )
     return float(fitness)
 
@@ -368,7 +355,7 @@ def train_controller(out_csv: Path, # type: ignore
     history = []
 
     # ---------- Phase 1: Exploration ----------
-    es = cma.CMAEvolutionStrategy(x0, 0.6,
+    es = cma.CMAEvolutionStrategy(x0, 0.65,
                                   {'popsize': popsize_phase1,
                                    'maxiter': iterations_phase1,
                                    'verb_disp': 1, 'verb_log': 0})
@@ -382,7 +369,7 @@ def train_controller(out_csv: Path, # type: ignore
         for x in xs:
             unflatten_params(nn_obj, x)
             # random start position
-            start_x = 0.5 + 0.05 if np.random.rand() < 1/5 else 2.8
+            start_x = 0.5 + 0.05 if np.random.rand() < 2/3 else 2.8
             f = evaluateFitness(model, world, nn_obj,
                                 target_pos=TARGET_POS,
                                 duration=duration,
@@ -399,7 +386,7 @@ def train_controller(out_csv: Path, # type: ignore
     best_f_phase1 = -es.result.fbest
 
     # ---------- Phase 2: Refinement ----------
-    es = cma.CMAEvolutionStrategy(best_x_phase1, 0.3,
+    es = cma.CMAEvolutionStrategy(best_x_phase1, 0.5,
                                   {'popsize': popsize_phase2,
                                    'maxiter': iterations_phase2,
                                    'verb_disp': 1, 'verb_log': 0})
@@ -413,7 +400,7 @@ def train_controller(out_csv: Path, # type: ignore
         for x in xs:
             unflatten_params(nn_obj, x)
             # random start position
-            start_x = 0.5 + 0.05 if np.random.rand() < 3/5 else 2.8 - 0.05
+            start_x = 0.5 + 0.05 if np.random.rand() < 2/5 else 2.8
             f = evaluateFitness(model, world, nn_obj,
                                 target_pos=TARGET_POS,
                                 duration=duration,
@@ -499,10 +486,10 @@ if __name__ == "__main__":
         print('hello')
         # train_controller(out_csv= DATA / "best.csv", # type: ignore
         #              duration = DURATION,
-        #              iterations_phase1= 100,
-        #              iterations_phase2 = 200,
+        #              iterations_phase1= 35,
+        #              iterations_phase2 = 400,
         #              popsize_phase1 = 120,
-        #              popsize_phase2 = 60,
+        #              popsize_phase2 = 85,
         #              hidden = 32)
         #train_controller(DATA / "best.csv", duration=args.dur, iterations=args.iters, popsize=args.pop)
     else:
