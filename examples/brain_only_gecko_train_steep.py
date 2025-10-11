@@ -616,7 +616,7 @@ def visualize(mode: ViewerTypes = "launcher", duration: float = DURATION, scene:
 
     spawn_override = np.array([2.5, 0.0, 0.12], dtype=np.float32)
 
-    world, model = build_world_and_model_at(spawn_override)
+    world, model = build_world_and_model_at(spos)
     nn_obj = NNController(nq=model.nq, nv=model.nv, nu=model.nu, hidden=32, freq_hz=3.0)
 
     params_path = DATA / "best_controller_params.npy"

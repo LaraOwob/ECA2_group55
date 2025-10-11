@@ -404,7 +404,7 @@ def visualize(mode: ViewerTypes = "launcher", duration: float = DURATION):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["train", "visualize"], default="train")
+    parser.add_argument("--mode", choices=["train", "visualize"], default="visualize")
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--pop", type=int, default=128)
     parser.add_argument("--dur", type=float, default=60.0)
