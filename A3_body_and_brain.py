@@ -65,12 +65,9 @@ import pandas as pd
 import os
 
 ######################################
-# brain_only_gecko.py
-# Minimal “brain-only” run on a single fixed body (gecko)
-# Modes: train (CMA-ES controller optimization), visualize (load & watch)
 
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional, Any
 import os
 import csv
 
@@ -101,13 +98,11 @@ DURATION = 10.0
 
 # --- scenarios you want to average over ---
 SCENARIOS = [
-    ("rugged", np.array([0.5, 0.0, 0.1], dtype=np.float32), 15.0),  # start at rugged
-    ("uphill", np.array([2.5, 0.0, 0.1], dtype=np.float32), 20.0),  # start at steep
+    ("rugged", np.array([0.5, 0.0, 0.04], dtype=np.float32), 15.0),  # start at rugged (lower spawn)
+    ("uphill", np.array([2.5, 0.0, 0.04], dtype=np.float32), 20.0),  # start at steep (lower spawn)
 ]
 
 ACTION_LOG = []
-
-ViewerTypes = Literal["launcher", "video", "simple", "frame"]
 
 # Data dir
 SCRIPT_NAME = Path(__file__).stem
@@ -117,7 +112,7 @@ DATA = Path("__data__") / SCRIPT_NAME
 
 # ---------- NN controller ----------
 class NNController(nn.Module):
-    def __init__(self, nq: int, nv: int, nu: int, hidden: int = 32, freq_hz: float = 3.0):
+    def __init__(self, nq: int, nv: int, nu: int, hidden: int = 32, freq_hz: float = 1.5):
         super().__init__()
         self.nq, self.nv, self.nu = nq, nv, nu
         self.in_dim = nq + nv + 2 + 2  # correct
@@ -126,6 +121,7 @@ class NNController(nn.Module):
         self.fc3 = nn.Linear(hidden, nu)  # output matches number of actuators
         self.act = nn.Tanh()
         self.freq_hz = freq_hz
+        self.u_prev = None
 
     def forward(self, qpos, qvel, t, target_pos, current_pos):
         w = 2 * torch.pi * self.freq_hz
@@ -143,7 +139,13 @@ class NNController(nn.Module):
 def flatten_params(net: nn.Module) -> np.ndarray:
     return np.concatenate([p.detach().cpu().numpy().ravel() for p in net.parameters()])
 
+def flatten_size(net: nn.Module) -> int:
+    return sum(p.numel() for p in net.parameters())
+
 def unflatten_params(net: nn.Module, flat: np.ndarray) -> None:
+    need = flatten_size(net)
+    if flat.size != need:
+        raise ValueError(f"Param size mismatch: file has {flat.size}, network expects {need}.")
     i = 0
     with torch.no_grad():
         for p in net.parameters():
@@ -152,40 +154,27 @@ def unflatten_params(net: nn.Module, flat: np.ndarray) -> None:
             i += n
 
 def _bind_geom_name(model: mj.MjModel) -> str:
+    """Return a valid geometry name to bind the Tracker to.
+    Prefer a geom named 'core' if present; otherwise fall back to the first geom name.
+    """
     try:
         _ = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "core")
         return "core"
     except Exception:
         return mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, 0)
 
-def build_world_and_model_at(spawn_pos):
-    mj.set_mjcb_control(None)
-    world = OlympicArena()
-    core = gecko()
-    world.spawn(core.spec, position=spawn_pos.tolist() ) #correct_for_bounding_box=True
-    model = world.spec.compile()
 
-    # --- diagnostic: print actuator names and ranges ---
-    print("\n[Actuator ranges]")
-    for i in range(model.nu):
-        name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_ACTUATOR, i)
-        lo, hi = model.actuator_ctrlrange[i]
-        print(f"{i:02d} {name:20s} [{lo:.2f}, {hi:.2f}]")
-    print("-------------------------------------------------\n")
-
-    return world, model
-
-def prepare_scenarios(): # type: ignore
+def prepare_scenarios(robot_spec):
     worlds, models, durations = [], [], []
-    for name, spos, dur in SCENARIOS: # type: ignore
-        w, m = build_world_and_model_at(spos)
+    for name, spos, dur in SCENARIOS:
+        w, m = build_world_and_model_at(robot_spec, spos)
         worlds.append(w); models.append(m); durations.append(dur)
-    # actuator scaling globals (use the first; same morphology)
+
     global CTRL_RANGE_ARR, AMP, MID, ACT_GAIN, ROBOT_BODY_ID, ROBOT_BODY_NAME
     CTRL_RANGE_ARR = models[0].actuator_ctrlrange.copy()
     AMP = (CTRL_RANGE_ARR[:,1] - CTRL_RANGE_ARR[:,0]) * 0.5
     MID = (CTRL_RANGE_ARR[:,1] + CTRL_RANGE_ARR[:,0]) * 0.5
-    ACT_GAIN = 1.2
+    ACT_GAIN = 1.0
     ROBOT_BODY_ID, ROBOT_BODY_NAME = find_robot_root_body(models[0])
     return worlds, models, durations
 
@@ -198,7 +187,7 @@ def mean_fitness_over_scenarios(nn_obj, worlds, models, durations):
 
 def nn_control_step(nn_obj, m, d, target_pos):
     global ACTION_LOG
-    # use body (root) pos for current_pos (as you set up)
+    # use body (root) pos for current_pos
     current_pos = torch.tensor(d.xpos[ROBOT_BODY_ID], dtype=torch.float32)
 
     qpos = torch.tensor(d.qpos[:nn_obj.nq], dtype=torch.float32)  # nq
@@ -206,22 +195,22 @@ def nn_control_step(nn_obj, m, d, target_pos):
 
     raw = nn_obj(qpos, qvel, d.time, torch.tensor(target_pos), current_pos).detach().numpy()
 
-    # indices: (2,3)=FL, (4,5)=FR, (6)=BL, (7)=BR
-    SIGN = np.ones(m.nu)
-    # try flipping right-side joints just to test
-    SIGN[[4,5,7]] = -1.0
-    raw *= SIGN
+    if nn_obj.u_prev is None: nn_obj.u_prev = raw
 
-    # raw has length nu; scale to actuator range:
-    a = MID + (AMP * ACT_GAIN) * np.clip(raw, -1.0, 1.0)
+    raw = 0.8*nn_obj.u_prev + 0.2*raw   # EMA smoothing
+    nn_obj.u_prev = raw
 
-    a = np.clip(a, CTRL_RANGE_ARR[:, 0], CTRL_RANGE_ARR[:, 1])
+    # return normalized action ONLY in [-1, 1]; Controller will scale to actuator ranges
+    u = np.clip(raw, -1.0, 1.0)
 
-    # log normalized command per joint: roughly in [-ACT_GAIN, ACT_GAIN]
-    norm_u = (a - MID) / np.maximum(AMP, 1e-6)
-    ACTION_LOG.append(norm_u.copy())
+    if len(ACTION_LOG) == 0:
+        print(f"[CTRLDBG] first cmd norm≈{np.linalg.norm(u):.3f}")
 
-    return np.clip(a, CTRL_RANGE_ARR[:, 0], CTRL_RANGE_ARR[:, 1])
+    ACTION_LOG.append(u.copy())
+
+    if len(ACTION_LOG) > 2048:
+        ACTION_LOG[:] = ACTION_LOG[-1024:]
+    return u
 
 # ---------- Fitness ----------
 '''def evaluate(model: mj.MjModel,
@@ -262,6 +251,9 @@ def nn_control_step(nn_obj, m, d, target_pos):
     proximity_bonus = max(0.0, 3.0 - dist_to_target) # simple shaping
     return progress_x + proximity_bonus'''
 
+def morph_sig(model: mj.MjModel) -> str:
+    return f"nq{model.nq}_nv{model.nv}_nu{model.nu}"
+
 def rot_to_yaw(xmat9: np.ndarray) -> float:
     # xmat9 is a 3x3 rotation matrix in row-major (flattened length 9)
     R = np.array([[xmat9[0], xmat9[1], xmat9[2]],
@@ -293,7 +285,7 @@ def evaluateFitness(model: mj.MjModel,
     data = mj.MjData(model)
     mj.mj_resetData(model, data)
 
-    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_BODY, name_to_bind=ROBOT_BODY_NAME)
+    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind="core")
     tracker.setup(world.spec, data)
 
     def _cb(m, d):  # controller callback
@@ -333,7 +325,10 @@ def evaluateFitness(model: mj.MjModel,
     on_slope = (x_mid >= x_rugged_end)
 
     # --- floor breach penalty ---
-    floor_pen = 20.0 if np.any(zs < 0.0) else 0.0
+    #floor_pen = 20.0 if np.any(zs < 0.0) else 0.0
+    # be tolerant to small numerical dips, only penalize if torso sinks clearly below terrain
+    z_floor_tol = -0.12   # allow slight negative due to contact/mesh noise
+    floor_pen = 15.0 if np.any(zs < z_floor_tol) else 0.0
 
     # --- ground gating (looser on slope) ---
     gate = np.where(on_slope, z0 + 0.40, z0 + 0.15)  # allow torso rise on slope
@@ -380,7 +375,7 @@ def evaluateFitness(model: mj.MjModel,
 
     # --- lateral penalties (relaxed on slope) ---
     lat_w_step = np.where(on_slope, 0.3 * w_lat, w_lat)
-    latvel_w_step = np.where(on_slope, 0.3 * 0.3, 0.3)
+    latvel_w_step = np.where(on_slope, 0.2, 0.3)
 
     lat_step = np.abs(ys[1:]) - y_tol
     lateral_pen = float(np.sum(np.clip(lat_step, 0.0, None) * lat_w_step))
@@ -389,7 +384,7 @@ def evaluateFitness(model: mj.MjModel,
     latvel_pen = float(np.sum(np.clip(np.abs(vy) - 0.05, 0.0, None) * latvel_w_step))
 
     # --- backward motion penalty (smaller on slope) ---
-    w_back_flat, w_back_slope = 0.5, 0.15
+    w_back_flat, w_back_slope = 0.3, 0.10
     neg_dx = np.clip(-dx, 0.0, None)
     back_pen = (
         w_back_flat  * float(np.sum(neg_dx[~on_slope])) +
@@ -412,14 +407,17 @@ def evaluateFitness(model: mj.MjModel,
     fall_pen = 5.0 if fall else 0.0
 
     # --- tiny heading nudge ---
-    yaw_align = 0.05 * np.cos(rot_to_yaw(xmat9))
+    try:
+        yaw_align = 0.01 * np.cos(rot_to_yaw(xmat9))*np.clip(dx.sum(),0,None)
+    except Exception:
+        yaw_align = 0.0
 
     # --- symmetry penalty (encourage L/R parity) ---
-    sym_pairs = [(2, 4), (3, 5), (6, 7)]
-    if ACTION_LOG:
+    sym_pairs = [(i, i+1) for i in range(0, model.nu - 1, 2)]  # (0,1), (2,3), ...
+    if ACTION_LOG and sym_pairs:
         A = np.asarray(ACTION_LOG)  # [T, nu]
         mu = np.mean(np.abs(A), axis=0)
-        sym_pen = 0.1 * sum((mu[i] - mu[j])**2 for i, j in sym_pairs)
+        sym_pen = 0.1 * sum((mu[i] - mu[j])**2 for (i, j) in sym_pairs)
     else:
         sym_pen = 0.0
     ACTION_LOG.clear()
@@ -429,15 +427,21 @@ def evaluateFitness(model: mj.MjModel,
         progress + vx_rew + dz_rew + finish_bonus + speed_bonus + climb_bonus + yaw_align
         - lateral_pen - latvel_pen - back_pen - fall_pen - floor_pen - oob_pen - sym_pen
     )
+
+    # DEBUG: print term breakdown (first few steps only)
+    print(f"[FITDBG] prog={progress:.3f} vx={vx_rew:.3f} dz={dz_rew:.3f} fin={finish_bonus:.3f} spd={speed_bonus:.3f} "
+          f"clmb={climb_bonus:.3f} yaw={yaw_align:.3f} | "
+          f"lat={lateral_pen:.3f} lvel={latvel_pen:.3f} back={back_pen:.3f} fall={fall_pen:.3f} "
+          f"floor={floor_pen:.3f} oob={oob_pen:.3f} sym={sym_pen:.3f} => fit={fitness:.3f}")
+
     return float(fitness)
 
 
 # ---------- Build world+model once for gecko ----------
-def build_world_and_model():
+def build_world_and_model_at(robot_spec, spawn_pos):
     mj.set_mjcb_control(None)
     world = OlympicArena()
-    core = gecko()
-    world.spawn(core.spec, position=SPAWN_POS, correct_for_bounding_box=True)
+    world.spawn(robot_spec, position=spawn_pos.tolist())
     model = world.spec.compile()
 
     # --- diagnostic: print actuator names and ranges ---
@@ -447,19 +451,6 @@ def build_world_and_model():
         lo, hi = model.actuator_ctrlrange[i]
         print(f"{i:02d} {name:20s} [{lo:.2f}, {hi:.2f}]")
     print("-------------------------------------------------\n")
-
-    # --- actuator range scaling ---
-    global CTRL_RANGE_ARR, AMP, MID, ACT_GAIN
-    CTRL_RANGE_ARR = model.actuator_ctrlrange.copy()
-    AMP = (CTRL_RANGE_ARR[:, 1] - CTRL_RANGE_ARR[:, 0]) * 0.5
-    MID = (CTRL_RANGE_ARR[:, 1] + CTRL_RANGE_ARR[:, 0]) * 0.5
-    ACT_GAIN = 1.2
-    # --------------------------------
-
-    # --- find and cache robot body ID ---
-    global ROBOT_BODY_ID, ROBOT_BODY_NAME
-    ROBOT_BODY_ID, ROBOT_BODY_NAME = find_robot_root_body(model)
-    # -------------------------------------
 
     return world, model
 
@@ -572,42 +563,38 @@ def find_robot_root_body(model: mj.MjModel) -> tuple[int, str]:
     return best_f, nn_obj'''
 
 def train_controller(out_csv: Path,
+                     robot_spec,  # <- pass the candidate body spec
                      duration: float = DURATION,
                      iterations: int = 12,
                      popsize: int = 16,
                      hidden: int = 32,
                      resume: bool = False,
                      init_sigma: float = 0.8):
-    """
-    CMA-ES training over NN weights, averaged across prepared scenarios.
-    - resume=True  -> warm-start from __data__/.../best_controller_params.npy if present
-    - resume=False -> start from random initialization
-    """
-    # build scenarios once
-    worlds, models, durations = prepare_scenarios()
 
-    # controller sized to the (identical) gecko model
+    # Build scenarios/worlds/models for THIS body
+    worlds, models, durations = prepare_scenarios(robot_spec)
     nn_obj = NNController(nq=models[0].nq, nv=models[0].nv, nu=models[0].nu,
                           hidden=hidden, freq_hz=3.0)
 
-    # ----- warm start (optional) -----
     DATA.mkdir(parents=True, exist_ok=True)
-    warm_path = DATA / "best_controller_params.npy"
+    sig = morph_sig(models[0])
+    params_path = DATA / f"best_controller_params_{sig}.npy"
+    curve_path  = DATA / f"fitness_curve_{sig}.csv"
+
+    # Warm start for THIS morphology only
     x0 = flatten_params(nn_obj)
-    if resume and warm_path.exists():
+    if resume and params_path.exists():
         try:
-            x0 = np.load(warm_path)
-            unflatten_params(nn_obj, x0)
-            print("[INFO] Warm-starting from previous best_controller_params.npy")
+            x0_loaded = np.load(params_path)
+            unflatten_params(nn_obj, x0_loaded)
+            x0 = x0_loaded
+            print(f"[INFO] Warm-starting from {params_path.name}")
         except Exception as e:
             print(f"[WARN] Could not warm-start ({e}). Starting fresh.")
 
-    # ----- CMA-ES -----
+    # CMA-ES
     es = cma.CMAEvolutionStrategy(x0, init_sigma, {
-        'popsize': popsize,
-        'maxiter': iterations,
-        'verb_disp': 1,
-        'verb_log': 0
+        'popsize': popsize, 'maxiter': iterations, 'verb_disp': 1, 'verb_log': 0
     })
 
     history = []
@@ -618,28 +605,36 @@ def train_controller(out_csv: Path,
             for x in xs:
                 unflatten_params(nn_obj, x)
                 f_mean = mean_fitness_over_scenarios(nn_obj, worlds, models, durations)
-                fs.append(-f_mean)  # CMA-ES minimizes
+                fs.append(-f_mean)  # minimize
             es.tell(xs, fs)
-            print(f"[INFO] Iter {es.countiter}/{iterations} best fitness: {-np.min(fs):.3f}")
-            history.append(-float(np.min(fs)))
+            best_iter = -float(np.min(fs))
+            print(f"[INFO] Iter {es.countiter}/{iterations} best fitness: {best_iter:.3f}")
+            history.append(best_iter)
     except KeyboardInterrupt:
         print("\n[INTERRUPT] Stopping early—saving best-so-far.")
     finally:
-        es.result_pretty()
-        best_x = es.result.xbest
-        best_f = -es.result.fbest
-        unflatten_params(nn_obj, best_x)
+        if es.countevals and es.countevals > 0:
+            es.result_pretty()
+            best_x = es.result.xbest
+            best_f = -es.result.fbest
+            unflatten_params(nn_obj, best_x)
+        else:
+            print("[WARN] CMA-ES ended without successful evaluations.")
+            best_x = flatten_params(nn_obj)  # fallback to current
+            best_f = -1e6  # or another sentinel
 
-        # save artifacts
-        np.savetxt(DATA / "fitness_curve.csv", np.array(history), delimiter=",")
-        np.save(warm_path, best_x)
+        # Save ONLY morphology-keyed artifacts (avoid generic file confusion)
+        np.savetxt(curve_path, np.array(history), delimiter=",")
+        np.save(params_path, best_x)
+
+        # Optional: CSV summary you’re already writing
         with open(out_csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["best_fitness"])
             w.writerow([best_f])
 
         print(f"[DONE] Best avg fitness over {len(SCENARIOS)} scenarios: {best_f:.3f} "
-              f"({'resumed' if resume else 'fresh'})")
+              f"({'resumed' if resume and params_path.exists() else 'fresh'})")
 
     return nn_obj, best_f
 
@@ -674,22 +669,23 @@ def train_controller(out_csv: Path,
         single_frame_renderer(model, data, save=True, save_path=str(DATA / "robot.png"))
         print(f"[OK] Frame saved to {DATA / 'robot.png'}")'''
 
-def visualize(mode: ViewerTypes = "launcher", duration: float = DURATION, scene: str = "rugged"):
-    # pick scenario by name
+def visualize(robot_spec,
+              mode: Literal["launcher","video","simple","no_control","frame","timestep"]="launcher",
+              duration: float = DURATION,
+              scene: str = "rugged"):
     match = [s for s in SCENARIOS if s[0] == scene]
     if not match:
         print(f"[ERR] Unknown scene '{scene}', choose from {[s[0] for s in SCENARIOS]}")
         return
     _, spos, dur = match[0]
 
-    spawn_override = np.array([2.5, 0.0, 0.12], dtype=np.float32)
-
-    world, model = build_world_and_model_at(spawn_override)
+    world, model = build_world_and_model_at(robot_spec, spos)
     nn_obj = NNController(nq=model.nq, nv=model.nv, nu=model.nu, hidden=32, freq_hz=3.0)
 
-    params_path = DATA / "best_controller_params.npy"
+    sig = morph_sig(model)
+    params_path = DATA / f"best_controller_params_{sig}.npy"
     if not params_path.exists():
-        print(f"[ERR] Missing {params_path}. Run with mode=train first.")
+        print(f"[ERR] Missing {params_path}. Train for this body first.")
         return
     unflatten_params(nn_obj, np.load(params_path))
 
@@ -697,7 +693,7 @@ def visualize(mode: ViewerTypes = "launcher", duration: float = DURATION, scene:
     CTRL_RANGE_ARR = model.actuator_ctrlrange.copy()
     AMP = (CTRL_RANGE_ARR[:,1] - CTRL_RANGE_ARR[:,0]) * 0.5
     MID = (CTRL_RANGE_ARR[:,1] + CTRL_RANGE_ARR[:,0]) * 0.5
-    ACT_GAIN = 1.2
+    ACT_GAIN = 1.0
     ROBOT_BODY_ID, ROBOT_BODY_NAME = find_robot_root_body(model)
 
     def _cb(m, d): return nn_control_step(nn_obj, m, d, TARGET_POS)
@@ -718,6 +714,18 @@ def visualize(mode: ViewerTypes = "launcher", duration: float = DURATION, scene:
         single_frame_renderer(model, data, save=True, save_path=str(DATA / "robot.png"))
         print(f"[OK] Frame saved to {DATA / 'robot.png'}")
 
+def plot_xy(traj_xy, title="Robot path"):
+    if traj_xy is None or len(traj_xy) < 2:
+        print("[plot] no trajectory")
+        return
+    x, y = traj_xy[:, 0], traj_xy[:, 1]
+    plt.figure(figsize=(6, 4))
+    plt.plot(x, y, linewidth=2)
+    plt.scatter([x[0]], [y[0]], marker='o', label='start')
+    plt.scatter([x[-1]], [y[-1]], marker='x', label='end')
+    plt.axis('equal'); plt.grid(True, alpha=0.3); plt.legend()
+    plt.title(title); plt.xlabel("x [m]"); plt.ylabel("y [m]")
+    plt.tight_layout(); plt.show()
 
 # ---------- CLI ----------
 # if __name__ == "__main__":
@@ -747,7 +755,7 @@ def visualize(mode: ViewerTypes = "launcher", duration: float = DURATION, scene:
 # Type Checking
 if TYPE_CHECKING:
     from networkx import DiGraph
-type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame","timestep"]
+#type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame","timestep"]
 
 SEED = 42
 RNG = np.random.default_rng(SEED)
@@ -789,11 +797,6 @@ WORKING_BODIES =set()
 #         h = self.tanh(self.fc2(h))
 #         y = self.tanh(self.fc3(h))
 #         return CTRL_RANGE * y
-
-    
-    
-    
-    
     
 
 def nn_controller(
@@ -829,9 +832,9 @@ def experiment(
     robot: Any,
     controller: Controller,
     duration: int = 5,
-    mode: ViewerTypes = "simple",
-
-) -> None:
+    mode: Literal["launcher", "video", "simple", "no_control", "frame", "timestep"] = "simple",
+) -> tuple[Optional[float], Optional[float], Optional[npt.NDArray[np.float64]]]: # type: ignore
+    
     """Run the simulation with random movements."""
     # ==================================================================== #
     # Initialise controller to controller to None, always in the beginning.
@@ -843,7 +846,7 @@ def experiment(
 
     # Spawn robot in the world
     # Check docstring for spawn conditions
-    world.spawn(robot.spec, position=[0, 0, 0.1])
+    world.spawn(robot.spec, position=[0, 0, 0.04])
     #gecko_core = gecko()  # DO NOT CHANGE
     #world.spawn(gecko_core.spec, spawn_position=[0, 0, 0])
     # Generate the model and data
@@ -867,9 +870,9 @@ def experiment(
     if num_hinges < 3 or num_blocks < 3:
         print("insufficient body")
         qacc_fitness = 0
-        return None, qacc_fitness
+        return None, qacc_fitness, None
     
-    # Pass the model and data to the tracker
+    '''# Pass the model and data to the tracker
     if controller.tracker is not None:
         controller.tracker.setup(world.spec, data)
     
@@ -880,14 +883,72 @@ def experiment(
 
     mj.set_mjcb_control(
         lambda m, d: controller.set_control(m, d, *args, **kwargs),
-    )
+    )'''
+
+    # Pass the model and data to the tracker (if any)
+    if controller.tracker is not None:
+        controller.tracker.setup(world.spec, data)
+
+    args: list[Any] = []
+    kwargs: dict[Any, Any] = {}
 
     # ------------------------------------------------------------------ #
     
-    # ✅ Record starting position
+    # Record starting position
     start_position = np.copy(data.qpos[:2])  # store x,y
     
     match mode:
+        case "simple":
+            mj.set_mjcb_control(lambda m, d: controller.set_control(m, d, *args, **kwargs))
+            simple_runner(model, data, duration=duration)
+
+        case "frame":
+            mj.set_mjcb_control(lambda m, d: controller.set_control(m, d, *args, **kwargs))
+            save_path = str(DATA / "robot.png")
+            single_frame_renderer(model, data, save=True, save_path=save_path)
+
+        case "video":
+            mj.set_mjcb_control(lambda m, d: controller.set_control(m, d, *args, **kwargs))
+            path_to_video_folder = str(DATA / "videos")
+            video_recorder = VideoRecorder(output_folder=path_to_video_folder)
+            video_renderer(model, data, duration=duration, video_recorder=video_recorder)
+
+        case "launcher":
+            mj.set_mjcb_control(lambda m, d: controller.set_control(m, d, *args, **kwargs))
+            viewer.launch(model=model, data=data)
+
+        case "no_control":
+            mj.set_mjcb_control(None)
+            viewer.launch(model=model, data=data)
+
+        case "timestep":
+            # IMPORTANT: no controller during feasibility
+            mj.set_mjcb_control(None)
+            print("in timestep")
+            num_steps = int(duration / model.opt.timestep)
+            maxQacc = 0.0
+            bad_streak = 0
+            warmup_steps = int(0.2 / model.opt.timestep)  # ignore first 0.2s
+
+            for step in range(num_steps):
+                mj.mj_step(model, data)
+
+                if step < warmup_steps:
+                    continue
+
+                qa = np.abs(data.qacc)
+                if np.any(np.isnan(qa)) or np.any(np.isinf(qa)):
+                    return None, 1.0, None  # NaN/Inf detected
+
+                maxQacc = max(maxQacc, float(np.max(qa)))
+                if maxQacc > 12000:
+                    bad_streak += 1
+                    if bad_streak >= 3:   # require persistence
+                        return None, maxQacc, None
+                else:
+                    bad_streak = 0
+
+    '''match mode:
         
         case "simple":
             # This disables visualisation (fastest option)
@@ -942,17 +1003,33 @@ def experiment(
                     return None, max(np.abs(data.qacc))
                 #if np.any(np.abs(data.qacc) > maxQacc):
                  #   maxQacc =max(np.abs(data.qacc))
-                  #  print(maxQacc)
+                  #  print(maxQacc)'''
 
-           
-     # ✅ After simulation — record end position
+    # After simulation — record end position
+    end_position = np.copy(data.qpos[:2])  # final x,y
+    distance = np.linalg.norm(end_position - start_position)
+
+    # Optional: collect XY trajectory if a tracker exists and recorded 'xpos'
+    traj_xy = None
+    if controller.tracker is not None:
+        hist = controller.tracker.history.get("xpos", {})
+        if hist:
+            key = next(iter(hist))
+            arr = np.asarray(hist[key])
+            if arr.ndim == 2 and arr.shape[1] >= 2:
+                traj_xy = arr[:, :2].copy()
+
+    # Return (distance, feasibility penalty or None, trajectory)
+    return distance, qacc_fitness, traj_xy     
+  
+    '''# After simulation — record end position
     end_position = np.copy(data.qpos[:2])  # final x,y
 
-    # ✅ Compute Euclidean distance travelled
+    # Compute Euclidean distance travelled
     distance = np.linalg.norm(end_position - start_position)
     
     # Return the scalar distance
-    return distance, qacc_fitness
+    return distance, qacc_fitness'''
 
 
 
@@ -988,16 +1065,27 @@ def makeBody(num_modules: int = 20, genotype=None, simulation = "timestep", dura
         # controller_callback_function=random_move,
         tracker=tracker,
     )
-    distance, weirdfitness = experiment(robot=core, controller=ctrl, mode=simulation,duration = duration)
-    if weirdfitness:
-        print("got weird fitness")
-        return core,weirdfitness
-    else:
-        WORKING_BODIES.add(core)
-        return core, None
+    distance, weirdfitness, traj = experiment(robot=core, controller=ctrl, mode=simulation, duration=duration)
+
+    if simulation != "timestep":
+        plot_xy(traj, "Feasibility run path")
+
+    if weirdfitness is not None and weirdfitness != 0:
+        # unstable
+        print("got weird fitness (unstable feasibility)")
+        return core, weirdfitness
+
+    if weirdfitness == 0:
+        # insufficient body
+        print("insufficient body feasibility")
+        return core, 0
+
+    # feasible
+    WORKING_BODIES.add(core)
+    return core, None
 
 
-def makeIndividual(body,genotype,QACC_fitness):
+'''def makeIndividual(body,genotype,QACC_fitness):
     #Create a body
     #Spawn core to get model, for nu
     if QACC_fitness:
@@ -1035,7 +1123,42 @@ def makeIndividual(body,genotype,QACC_fitness):
                 "fitness": fitness
             }
        
-        return individual
+        return individual'''
+
+def makeIndividual(body, genotype, QACC_fitness):
+    # QACC_fitness meanings from experiment():
+    #   None  -> feasible (train brain)
+    #   0     -> insufficient body (penalize, skip training)
+    #  > 0    -> unstable/NaN/high qacc (penalize, skip training)
+
+    if QACC_fitness is None:
+        # feasible -> train controller
+        trained_nn, fitness = train_controller(
+        DATA / "best.csv",
+        robot_spec=body.spec,          # ← pass the candidate body
+        duration=15, iterations=10, popsize=5, resume=False
+    )
+        return {
+            "genotype": genotype,
+            "robot_spec": body,
+            "nn": trained_nn,
+            "fitness": float(fitness),
+        }
+
+    # infeasible or unstable -> penalize
+    if QACC_fitness == 0:
+        # insufficient body
+        fitness = -1e6
+    else:
+        # unstable -> larger qacc is worse
+        fitness = -float(QACC_fitness)
+
+    return {
+        "genotype": genotype,
+        "robot_spec": body,
+        "nn": None,
+        "fitness": fitness,
+    }
  
 def flatten_genotype(genotype):
     """Flatten the genotype (3 vectors of size 64) into a single 192-element vector."""
@@ -1046,18 +1169,14 @@ def unflatten_genotype(flat_vector):
     return [flat_vector[0:64], flat_vector[64:128], flat_vector[128:192]]
 
 def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5):
-    """
-    CMA-ES for evolving robot genotypes with dummy fitness evaluation.
-    """
     rng = np.random.default_rng(seed)
-    dim = 192  # 3 vectors of size 64
-    x0 = rng.random(dim)  # Initial mean
+    dim = 192
+    x0 = rng.random(dim)
     es = cma.CMAEvolutionStrategy(x0, sigma, {'popsize': pop_size, 'seed': seed})
 
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    
-    
-    best_fit = np.inf
+
+    best_fit = -np.inf          # maximize
     best_candidate = None
 
     with open(out_csv, "w", newline="") as f:
@@ -1066,25 +1185,31 @@ def train_mlp_cmaes(out_csv, generations=100, pop_size=30, seed=0, sigma=0.5):
 
         for g in range(generations):
             solutions = es.ask()
-            fitnesses = []
+            fit_pos: list[float] = []     # keep POSITIVE fitnesses here
+
             for sol in solutions:
                 genotype = unflatten_genotype(np.clip(sol, 0.1, 0.9).astype(np.float32))
-                body,Qacc_fitness = makeBody(num_modules=20, genotype=genotype)
-                individual = makeIndividual(body, genotype,Qacc_fitness)
-                fitness = individual["fitness"]
-                fitnesses.append(fitness) 
-                if fitness < best_fit:
-                    best_fit = fitness
-                    best_candidate = individual
-            es.tell(solutions, fitnesses)
+                body, qacc_fitness = makeBody(num_modules=20, genotype=genotype)
+                indiv = makeIndividual(body, genotype, qacc_fitness)
 
-            # Stats for CSV
-            gen_best = float(np.min(fitnesses))
-            gen_mean = float(np.mean(fitnesses))
-            gen_median = float(np.median(fitnesses))
+                f_val = float(indiv["fitness"])     # ensure numeric
+                fit_pos.append(f_val)
+
+                if f_val > best_fit:                # maximize
+                    best_fit = f_val
+                    best_candidate = indiv
+
+            # CMA-ES MINIMIZES -> pass NEGATIVES
+            fitnesses_neg = [-f for f in fit_pos]
+            es.tell(solutions, fitnesses_neg)
+
+            # Log stats using positive values
+            gen_best = float(np.max(f_pos := np.array(fit_pos, dtype=float)))
+            gen_mean = float(np.mean(f_pos))
+            gen_median = float(np.median(f_pos))
             writer.writerow([g, gen_best, gen_mean, gen_median])
-    return best_candidate, best_fit
 
+    return best_candidate, best_fit
 
 
 
@@ -1113,14 +1238,16 @@ def initializePopulation(pop_size: int = 10, num_modules: int = 20):
 
 
 
-def mutation(a,b,c,F):
-    #mutant = pop[a] + F * (pop[b] - pop[c])
-    mutant_genotye = [np.zeros(64)]*3
+def mutation(a, b, c, F):
+    # a, b, c are 3-vector genotypes (each vector length 64)
+    mutant_genotype = [np.zeros(64, dtype=np.float32) for _ in range(3)]
     for vector in range(3):
-        for gene in range(64):
-            difference = b[vector][gene] - c[vector][gene]
-            mutant_genotye[vector][gene] = a[vector][gene] + F * difference
-    return mutant_genotye
+        # ensure we operate on numpy arrays
+        A = np.asarray(a[vector], dtype=np.float32)
+        B = np.asarray(b[vector], dtype=np.float32)
+        C = np.asarray(c[vector], dtype=np.float32)
+        mutant_genotype[vector] = A + F * (B - C)
+    return mutant_genotype
 
 def crossover(parent, mutant, CR, vector_size=3, gene_size=64):
     """
@@ -1152,7 +1279,7 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
     print("made population")
     #Finds best fitnesses
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    best_idx = int(np.argmin(fits))
+    best_idx = int(np.argmax(fits))
     best_candidate = pop[best_idx].copy()
     best_fit = float(fits[best_idx])
 
@@ -1177,20 +1304,20 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
                 f_trial = trialindividual["fitness"] #fitness is negative distance to target
 
                 # If trial is better than parent than trial enters population
-                if f_trial <= fits[i]:
+                if f_trial >= fits[i]:
                     pop[i] = trialindividual
                     fits[i] = f_trial
 
             # Retrieve stats: best fitness, mean fitness and median fitness and write to csv
-            gen_best = float(np.min(fits))
+            gen_best = float(np.max(fits))
             gen_mean = float(np.mean(fits))
             gen_median = float(np.median(fits))
             writer.writerow([g, gen_best, gen_mean, gen_median])
 
             # Update and check best candidate with best fitness
-            if gen_best < best_fit:
+            if gen_best > best_fit:
                 best_fit = gen_best
-                best_candidate = pop[int(np.argmin(fits))].copy()
+                best_candidate = pop[int(np.argmax(fits))].copy()
 
             #Print every after every 10th generation
             #if (g + 1) % max(1, generations // 10) == 0:
@@ -1389,11 +1516,9 @@ def main(action, generations = 1, pop_size = 5, seed = [0]):
             print("DE Time:", end_de - start_de)
             #simulate core quickly to see if it is feasible
             print(f"DE found {len(WORKING_BODIES)} bodies in total \n\n\n")
-        if best_candidate_DE["robot_spec"]:
-            print("find a body")
-            makeBody(genotype = best_candidate_DE["genotype"], simulation = "launcher", duration = 15)
-
-        show_xpos_history(tracker.history["xpos"][0])
+        if best_candidate_DE and best_candidate_DE.get("robot_spec") is not None:
+            visualize(robot_spec=best_candidate_DE["robot_spec"].spec, mode="launcher", scene="rugged")
+                #show_xpos_history(tracker.history["xpos"][0])
             
     if action == "plot CMAES":
         exp_csvs = sorted(glob.glob(f"./results/CMAES/CMAES_{generations}_{pop_size}_seed*.csv"))
