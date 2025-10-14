@@ -17,14 +17,14 @@ from pathlib import Path
 from typing import cast
 
 # Third-party libraries
-import mujoco
+import mujoco as mj
 import numpy as np
 
 # Local libraries
 from ariel import log
 from ariel.parameters.ariel_types import Position, Rotation
 from ariel.parameters.mujoco_params import MujocoConfig
-from ariel.utils.mujoco_ops import duplicate_mj_spec, euler_to_quat_conversion
+from ariel.utils.mujoco_ops import euler_to_quat_conversion
 
 
 class BaseWorld:
@@ -46,6 +46,19 @@ class BaseWorld:
         *,
         load_precompiled: bool = True,
     ) -> None:
+        """
+        Initialize the world specification.
+
+        Parameters
+        ----------
+        name : str, optional
+            Name of the world, by default None
+        mujoco_config : MujocoConfig, optional
+            Configuration parameters for MuJoCo, by default None
+        load_precompiled : bool, optional
+            Whether to load a precompiled XML file if available, by default True
+        """
+
         # Use default mujoco config if none is provided
         if mujoco_config is None:
             self.mujoco_config = MujocoConfig()
@@ -55,21 +68,30 @@ class BaseWorld:
             self.name = name
 
         # Load precompiled XML if requested
-        if load_precompiled:
-            self.is_precompiled = self.load_precompiled()
+        if load_precompiled is True:
+            log.debug("Attempting to load precompiled XML...")
+            self.is_precompiled = self.load_from_xml()
             if self.is_precompiled:
+                log.debug("Precompiled XML loaded successfully.")
                 return
 
         # Build and save specification
-        self.spec: mujoco.MjSpec = self._init_spec()
+        self.spec: mj.MjSpec = self._init_spec()
 
     @abstractmethod
     def _expand_spec(self) -> None:
         """Expand the world specification with additional elements."""
 
-    def _init_spec(self) -> mujoco.MjSpec:
-        spec = mujoco.MjSpec()
+    def _init_spec(self) -> mj.MjSpec:
+        """Initialize the MuJoCo specification."""
+
+        spec = mj.MjSpec()
+
+        # Model name
         spec.modelname = self.name.replace("-", " ").title()
+
+        # Copy during attach
+        spec.copy_during_attach = True
 
         # --- Option --- #
         spec.option.integrator = self.mujoco_config.integrator
@@ -88,7 +110,7 @@ class BaseWorld:
             name="light",
             pos=[0, 0, 1],
             castshadow=False,
-            type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL,
+            type=mj.mjtLightType.mjLIGHT_DIRECTIONAL,
         )
 
         # Add ortho camera and normal camera
@@ -101,99 +123,215 @@ class BaseWorld:
         )
         return spec
 
-    def _find_contacts(self) -> set[tuple[str, str, float]]:
-        # Create a temporary copy of the spec to compile
-        temp_spec = duplicate_mj_spec(self.spec)
-        model = temp_spec.compile()
-        data = mujoco.MjData(model)
+    def _find_lowest_position(
+        self,
+        spawn_name: str,
+    ) -> float:
+        """Find the lowest Z position of the spawned robot.
+
+        Parameters
+        ----------
+        spawn_name : str
+            Prefix name of the spawned robot to identify its geometries.
+        
+        Returns
+        -------
+            float
+                The lowest Z position of the robot in the world."""
+        # Generate model and data from a temporary copy of the spec
+        model: mj.MjModel = cast("mj.MjModel", self.spec.compile())
+        data = mj.MjData(model)
 
         # Step the simulation to ensure everything is stable
-        mujoco.mj_forward(model, data)
+        mj.mj_forward(model, data)
+
+        # Iterate over all geoms
+        lowest_point = np.inf
+        for i in range(model.ngeom):
+            # Get the geometry
+            geom = data.geom(i)
+            bodyid = int(model.geom_bodyid[geom.id])
+            parentid = int(model.body(bodyid).parentid[0])
+
+            # Possible names
+            name_of_geom = geom.name
+            name_of_body = model.body(bodyid).name
+            name_of_parent = model.body(parentid).name
+
+            # If the geom does not belong to the spawned robot, skip it
+            if (
+                (spawn_name not in name_of_geom)
+                and (spawn_name not in name_of_body)
+                and (spawn_name not in name_of_parent)
+            ):
+                continue
+
+            # Global position of the geometry (x, y, z)
+            pos = data.geom_xpos[geom.id]
+
+            # World rotation matrix (flat 9 values in row-major)
+            r_mat = np.array(data.geom_xmat[geom.id]).reshape(3, 3)
+
+            # Local half-sizes (sx, sy, sz)
+            sx, sy, sz = model.geom_size[geom.id]  # box half extents
+
+            # Generate 8 local corner offsets
+            corners_local = np.array([
+                [dx * sx, dy * sy, dz * sz]
+                for dx in (-1, 1)
+                for dy in (-1, 1)
+                for dz in (-1, 1)
+            ])
+
+            # Transform corners: world_corner = pos + R @ local_corner
+            corners_world = pos + corners_local @ r_mat.T  # (8,3)
+
+            # Return the lowest Z value
+            maybe_lowest_point = np.min(corners_world[:, 2])
+            lowest_point = min(lowest_point, maybe_lowest_point)
+
+        # Clear the temporary objects
+        del model, data
+
+        # Return the lowest position rounded to avoid floating point issues
+        if lowest_point == np.inf:
+            return 0.0
+        return np.round(lowest_point, 6)
+
+    def _find_contacts(self) -> set[tuple[str, str, float]]:
+        # Generate model and data
+        model = self.spec.compile()
+        data = mj.MjData(model)
+
+        # Step the simulation to ensure everything is stable
+        mj.mj_forward(model, data)
 
         # Discover contacts between the world and the spawned robots
         contact_pairs = set()
         for contact in data.contact:
-            geom1 = mujoco.mj_id2name(
+            geom1 = mj.mj_id2name(
                 m=model,
-                type=mujoco.mjtObj.mjOBJ_GEOM,
+                type=mj.mjtObj.mjOBJ_GEOM,
                 id=contact.geom1,
             )
-            geom2 = mujoco.mj_id2name(
+            geom2 = mj.mj_id2name(
                 m=model,
-                type=mujoco.mjtObj.mjOBJ_GEOM,
+                type=mj.mjtObj.mjOBJ_GEOM,
                 id=contact.geom2,
             )
             contact_pairs |= {(geom1, geom2, contact.dist)}
 
         # Clear the temporary objects
-        del model, data, temp_spec
+        del model, data
 
         # Return the set of contact pairs
         return contact_pairs
 
     def _check_and_correct_spawn(
         self,
-        spawn: mujoco.MjsBody,
+        spawn_site: mj.MjsBody,
+        spawn_body: mj.MjsBody,
         spawn_name: str,
+        base_point: float = 0.01,
+        *,
+        validate_no_collisions: bool = False,
     ) -> None:
-        validation_steps = 0
-        validation_steps_max = 100
-        while validation_steps < validation_steps_max:
-            # Check for negative contacts
-            contact_pairs = self._find_contacts()
+        """
+        Check and correct the spawn position to avoid collisions with the floor.
 
-            # Handle any negative contacts found
+        
+        Parameters        
+        ----------
+        spawn_site : mj.MjsBody
+            The site where the robot is spawned.
+        spawn_body : mj.MjsBody
+            The body of the spawned robot.
+        spawn_name : str
+            The prefix name of the spawned robot.
+        base_point : float, optional
+            Minimum distance above the lowest point of the robot, by default 0.01
+        validate_no_collisions : bool, optional
+            Whether to validate the spawn position for collisions, by default False
+        """
+
+        # Log the correction process
+        msg = "-" * 60
+        log.debug(msg)
+
+        # Get the spawn position
+        msg = f"Initial spawn position: {spawn_site.pos}"
+        log.debug(msg)
+
+        # Find lowest position of the robot
+        lowest_position = self._find_lowest_position(spawn_name)
+        msg = f"Lowest robot position: {lowest_position} m"
+        log.debug(msg)
+
+        # Adjust the spawn position to ensure the robot is above ground
+        diff_from_base = (base_point + spawn_site.pos[2]) - lowest_position
+        spawn_body.pos[2] += diff_from_base
+        msg = f"Adjusted spawn position: {spawn_body.pos}"
+        log.debug(msg)
+
+        # Validate the spawn position by checking for collisions
+        if validate_no_collisions is True:
+            contact_pairs = self._find_contacts()
             for contact in contact_pairs:
                 # Unpack contact details
-                geom1: str | None = cast("str|None", contact[0])
-                geom2: str | None = cast("str|None", contact[1])
-                dist: float = contact[2]
+                geom1_name, geom2_name, dist = contact
 
-                # Get the floor name
+                # If there is a collision with the floor, log a warning
                 floor_name = self.mujoco_config.floor_name
-
-                # Sometimes the spawn name is not given
-                if geom1 is None:
-                    geom1 = spawn_name
-                if geom2 is None:
-                    geom2 = spawn_name
-
-                # Check if one of the geoms is the floor and the other is the robot
-                one_geom_is_floor = floor_name in geom1 or floor_name in geom2
-                one_geom_is_robot = spawn_name in geom1 or spawn_name in geom2
-                if one_geom_is_floor and one_geom_is_robot:
-                    # Log the collision details
-                    msg = "Spawn position causes collision with the world."
+                if floor_name in geom1_name or floor_name in geom2_name:
+                    msg = "Spawn position causes collision with the floor!\n"
+                    msg += f"--> '{geom1_name}', '{geom2_name}'\n"
+                    msg += f"\t With distance: {dist}\n"
+                    msg += " Please adjust the spawn position: \n"
+                    msg += f"\t {spawn_site.pos=}"
+                    log.warning(msg)
+                else:
+                    # Log other collisions as debug info
+                    msg = "Spawn position causes collision!\n"
+                    msg += f"--> '{geom1_name}', '{geom2_name}'\n"
+                    msg += f"\t With distance: {dist}"
                     log.debug(msg)
-                    msg = f"Collision details: {geom1=}, {geom2=}, {dist=}"
-                    log.debug(msg)
-
-                    # Raise the spawn position by the penetration depth
-                    correction = np.round(abs(dist) + 0.01, 5)
-                    spawn.pos[2] += correction
-
-                    # Log the new spawn position
-                    msg = "Correcting automatically by raising the robot: \n"
-                    msg += f"New spawn position: {spawn.pos} (+{correction} m)"
-                    log.debug(msg)
-                    break
-            validation_steps += 1
-
-        # Log the completion of the validation
-        msg = f"Validation completed in {validation_steps} steps."
-        msg += f" Final spawn position: {spawn.pos}"
-        log.debug(msg)
 
     def spawn(
         self,
-        robot_spec: mujoco.MjSpec,
+        robot_spec: mj.MjSpec,
         position: Position | None = None,
         rotation: Rotation | None = None,
         spawn_prefix: str | None = None,
         *,
-        correct_spawn_for_collisions: bool = True,
+        correct_collision_with_floor: bool = True,
+        validate_no_collisions: bool = False,
         rotation_sequence: str = "XYZ",  # xyzXYZ, assume intrinsic
-    ) -> mujoco.MjSpec:
+    ) -> mj.MjSpec:
+        """
+        Spawn a robot into the world at a specified position and orientation.
+        
+        Parameters
+        ----------
+        robot_spec : mj.MjSpec
+            The MuJoCo specification of the robot to be spawned.
+        position : Position, optional
+            The (x, y, z) position to spawn the robot, by default None
+        rotation : Rotation, optional
+            The (x, y, z) Euler angles (in degrees) for the robot's orientation, by default None
+        spawn_prefix : str, optional
+            Prefix for naming the spawned robot, by default None
+        correct_collision_with_floor : bool, optional
+            Whether to adjust the spawn position to avoid collisions with the floor, by default True
+        validate_no_collisions : bool, optional
+            Whether to validate the spawn position for collisions after adjustment, by default False
+        rotation_sequence : str, optional
+            The sequence of axes for Euler to quaternion conversion, by default "XYZ"
+        
+        Returns
+        -------
+            mj.MjSpec
+                The updated MuJoCo world specification with the spawned robot.
+        """
         # Default spawn position
         if position is None:
             position = self.default_spawn_position
@@ -209,9 +347,6 @@ class BaseWorld:
         # If no prefix is given, use the default one
         if spawn_prefix is None:
             spawn_prefix = self.spawn_prefix
-
-        # Make a copy of the robot and world specs
-        temp_robot_spec = duplicate_mj_spec(robot_spec)
 
         # Convert rotation from Euler angles (degrees) to quaternion
         rotation_as_quat = euler_to_quat_conversion(
@@ -229,23 +364,28 @@ class BaseWorld:
         )
 
         # Attach the robot body to the spawn site
-        spawn_name = f"{spawn_prefix}{self.spawns}-"
-        spawn = spawn_site.attach_body(
-            body=temp_robot_spec.worldbody,
+        spawn_name = f"{spawn_prefix}{self.spawns}_"
+        spawn_body = spawn_site.attach_body(
+            body=robot_spec.worldbody,
             prefix=spawn_name,
         )
 
-        # Allow the robot to move freely
-        spawn.add_freejoint()
+        # Correct the spawn position if requested
+        if correct_collision_with_floor is True:
+            self._check_and_correct_spawn(
+                spawn_site,
+                spawn_body,
+                spawn_name,
+                validate_no_collisions=validate_no_collisions,
+            )
 
-        # Validate the updated world spec
-        if correct_spawn_for_collisions is True:
-            self._check_and_correct_spawn(spawn, spawn_name)
+        # Allow the robot to move freely
+        spawn_body.add_freejoint()
 
         # Return a copy of the updated spec
-        return duplicate_mj_spec(self.spec)
+        return self.spec
 
-    def compile_to_xml(self) -> None:
+    def store_to_xml(self) -> None:
         # Derive save path
         this_script_path = Path(__file__)
         save_dir = this_script_path.parent / "pre_compiled"
@@ -257,7 +397,7 @@ class BaseWorld:
         with save_path.open("w") as f:
             f.write(xml)
 
-    def load_precompiled(self) -> bool:
+    def load_from_xml(self) -> bool:
         # Derive XML path
         this_script_path = Path(__file__)
         xml_path = this_script_path.parent / "pre_compiled" / f"{self.name}.xml"
@@ -267,5 +407,5 @@ class BaseWorld:
             return False
 
         # Load the XML file
-        self.spec = mujoco.MjSpec.from_file(str(xml_path))
+        self.spec = mj.MjSpec.from_file(str(xml_path))
         return True

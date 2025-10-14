@@ -54,10 +54,24 @@ console = Console()
 
 
 class NeuralDevelopmentalEncoding(nn.Module):
-    def __init__(self, number_of_modules: int) -> None:
+    def __init__(self, number_of_modules: int, genotype_size: int = 64) -> None:
         super().__init__()
+        """
+        Neural developmental encoder.
+
+        Given a genotype (list of chromosomes), output the phenotype
+        (probability matrices corresponding to module types, connections, rotations).
+
+        Parameters
+        ----------
+        number_of_modules : int
+            Number of modules in the robot.
+        genotype_size : int, optional
+            Size of each genotype chromosome, by default 64.
+        """
+
         # Hidden Layers
-        self.fc1 = nn.Linear(64, 64)
+        self.fc1 = nn.Linear(genotype_size, 64)
         self.fc2 = nn.Linear(64, 32)
         self.fc3 = nn.Linear(32, 64)
         self.fc4 = nn.Linear(64, 128)
@@ -96,6 +110,7 @@ class NeuralDevelopmentalEncoding(nn.Module):
 
         # Activations
         self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
         self.sigmoid = nn.Sigmoid()
 
         # Disable gradients for all parameters
@@ -106,6 +121,19 @@ class NeuralDevelopmentalEncoding(nn.Module):
         self,
         genotype: list[npt.NDArray[np.float32]],
     ) -> list[npt.NDArray[np.float32]]:
+        """
+        Forward pass through the neural developmental encoder.
+
+        Parameters
+        ----------
+        genotype : list[npt.NDArray[np.float32]]
+            List of chromosomes (numpy arrays).
+        Returns
+        -------
+        list[npt.NDArray[np.float32]]
+            List of phenotype outputs (numpy arrays).
+        """
+
         outputs: list[npt.NDArray[np.float32]] = []
         for idx, chromosome in enumerate(genotype):
             with torch.no_grad():  # double safety
@@ -115,7 +143,7 @@ class NeuralDevelopmentalEncoding(nn.Module):
                 x = self.relu(x)
 
                 x = self.fc2(x)
-                x = self.relu(x)
+                x = self.tanh(x)
 
                 x = self.fc3(x)
                 x = self.relu(x)
