@@ -108,6 +108,25 @@ NUM_OF_MODULES = 30
 TARGET_POS = [5, 0, 0.5]
 SPAWN_POS = [-0.8, 0, 0]
 DURATION = 10.0
+################
+#################
+#############
+#IMPORTANT to change!!!!!!!!!!!!!!!!!!!!
+
+GLOBAL_SEED = 44
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # --- scenarios you want to average over ---
 SCENARIOS = [
@@ -594,8 +613,8 @@ def train_controller(out_csv: Path,
 
     DATA.mkdir(parents=True, exist_ok=True)
     sig = morph_sig(models[0])
-    params_path = DATA / f"best_controller_params_{sig}.npy"
-    curve_path  = DATA / f"fitness_curve_{sig}.csv"
+    params_path = DATA / f"{GLOBAL_SEED}_best_controller_params_{sig}.npy"
+    curve_path  = DATA / f"{GLOBAL_SEED}_fitness_curve_{sig}.csv"
 
     # Warm start for THIS morphology only
     x0 = flatten_params(nn_obj)
@@ -1151,6 +1170,7 @@ def makeBody(num_modules: int = 20, genotype=None, simulation = "timestep", dura
 BRAINTIME = []
 def makeIndividual(body, genotype, QACC_fitness):
     global BRAINTIME
+   
     # QACC_fitness meanings from experiment():
     #   None  -> feasible (train brain)
     #   0     -> insufficient body (penalize, skip training)
@@ -1160,7 +1180,7 @@ def makeIndividual(body, genotype, QACC_fitness):
         # feasible -> train controller
         startbrain = time.time()
         trained_nn, fitness = train_controller(
-        DATA / "best.csv",
+        DATA / f"{GLOBAL_SEED}_best.csv",
         robot_spec=body,          # ← pass the candidate body
         duration=5, iterations=2, popsize=3, resume=True
     )
@@ -1522,8 +1542,9 @@ def save_body_json_from_genotype(genotype, num_modules: int, out_path: str | Pat
 
 
     
-def main(action, generations = 5, pop_size = 10,seed = [44]):
+def main(action, generations = 1, pop_size = 5,seed = [GLOBAL_SEED]):
     global WORKING_BODIES
+    
     if action == "CMAES":
         WORKING_BODIES = set()
         best_candidate_CMAES = None
@@ -1546,7 +1567,7 @@ def main(action, generations = 5, pop_size = 10,seed = [44]):
         WORKING_BODIES = set()
         best_candidate_CMAES = None
         for s in seed:
-            file_path =  f"./results/DE/DE{generations}_{pop_size}_seed{s}.csv"
+            file_path =  f"./results_{GLOBAL_SEED}/DE/DE{generations}_{pop_size}_seed{s}.csv"
             print(f"Starting DE algorithm with {generations} generations and population {pop_size} and seed {s}...")
             start_de = time.time()
             best_candidate_DE, best_fit_DE = train_mlp_de(out_csv=file_path, generations=generations, pop_size=pop_size, seed=s)
@@ -1562,7 +1583,7 @@ def main(action, generations = 5, pop_size = 10,seed = [44]):
         if best_candidate_DE and best_candidate_DE.get("genotype") is not None:
             out_dir = DATA / "bodies"
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_json = out_dir / "best_DE_body.json"
+            out_json = out_dir / f"{GLOBAL_SEED}_best_DE_body.json"
             save_body_json_from_genotype(best_candidate_DE["genotype"], num_modules=20, out_path=out_json)
             print(f"[OK] Saved best DE body JSON to {out_json}")
         
