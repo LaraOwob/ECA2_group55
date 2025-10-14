@@ -1,8 +1,6 @@
 #from pyswarm import pso
 from scipy.optimize import differential_evolution
-import numpy as np
 import time
-
 
 # Standard library
 from pathlib import Path
@@ -34,58 +32,22 @@ from ariel.utils.video_recorder import VideoRecorder
 
 from ariel.simulation.tasks.targeted_locomotion import distance_to_target
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import mujoco as mj
-from ariel.body_phenotypes.robogen_lite.constructor import construct_mjspec_from_graph
-from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import HighProbabilityDecoder
-from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
-from ariel.simulation.controllers.controller import Controller
-from ariel.simulation.environments import OlympicArena
-from ariel.utils.runners import simple_runner
-from ariel.utils.tracker import Tracker
 #from stable_baselines3 import SAC
 import os
 import cma
-from scipy.optimize import differential_evolution
 import csv
-import numpy as np
-import csv
-import os
-import time
-import cma
-#from pyswarm import pso
 import glob
-
-import time
-import matplotlib.pyplot as plt
 import pandas as pd
-import os
 
 ######################################
 
-from pathlib import Path
 from typing import Literal, Optional, Any
-import os
-import csv
-
-import numpy as np
-import torch
-import torch.nn as nn
-import mujoco as mj
-from mujoco import viewer
-import cma  # type: ignore
 
 # ARIEL imports
-from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
-from ariel.simulation.environments import OlympicArena
-from ariel.simulation.controllers.controller import Controller
-from ariel.utils.runners import simple_runner
-from ariel.utils.tracker import Tracker
-from ariel.utils.video_recorder import VideoRecorder
-from ariel.utils.renderers import video_renderer, single_frame_renderer
+# from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 
 # ---------- Config ----------
 SEED = 42
@@ -635,7 +597,6 @@ def train_controller(out_csv: Path,
 
         print(f"[DONE] Best avg fitness over {len(SCENARIOS)} scenarios: {best_f:.3f} "
               f"({'resumed' if resume and params_path.exists() else 'fresh'})")
-
     return nn_obj, best_f
 
 
@@ -756,9 +717,6 @@ def plot_xy(traj_xy, title="Robot path"):
 if TYPE_CHECKING:
     from networkx import DiGraph
 #type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame","timestep"]
-
-SEED = 42
-RNG = np.random.default_rng(SEED)
 
 # --- DATA SETUP ---
 SCRIPT_NAME = __file__.split("/")[-1][:-3]
@@ -1072,7 +1030,7 @@ def makeBody(num_modules: int = 20, genotype=None, simulation = "timestep", dura
 
     if weirdfitness is not None and weirdfitness != 0:
         # unstable
-        print("got weird fitness (unstable feasibility)")
+        print("got weird fitness (unstable feasibility)").   
         return core, weirdfitness
 
     if weirdfitness == 0:
@@ -1136,7 +1094,7 @@ def makeIndividual(body, genotype, QACC_fitness):
         trained_nn, fitness = train_controller(
         DATA / "best.csv",
         robot_spec=body.spec,          # ← pass the candidate body
-        duration=15, iterations=10, popsize=5, resume=False
+        duration=10, iterations=2, popsize=5, resume=False
     )
         return {
             "genotype": genotype,
@@ -1368,11 +1326,6 @@ def plot(file_path,output_path):
     print(f"✅ Plot saved to {output_path}")
     
     
-    
-    
-    
-    
-    
 def load_series(csv_path):
     print(csv_path)
     df = pd.read_csv(csv_path)
@@ -1517,7 +1470,7 @@ def main(action, generations = 1, pop_size = 5, seed = [0]):
             #simulate core quickly to see if it is feasible
             print(f"DE found {len(WORKING_BODIES)} bodies in total \n\n\n")
         if best_candidate_DE and best_candidate_DE.get("robot_spec") is not None:
-            visualize(robot_spec=best_candidate_DE["robot_spec"].spec, mode="launcher", scene="rugged")
+            visualize(robot_spec=best_candidate_DE["robot_spec"].spec, mode="video", scene="rugged")
                 #show_xpos_history(tracker.history["xpos"][0])
             
     if action == "plot CMAES":
