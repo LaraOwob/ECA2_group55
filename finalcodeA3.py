@@ -113,7 +113,7 @@ DURATION = 10.0
 #############
 #IMPORTANT to change!!!!!!!!!!!!!!!!!!!!
 
-GLOBAL_SEED = 44
+GLOBAL_SEED = 55
 
 
 
@@ -1182,7 +1182,7 @@ def makeIndividual(body, genotype, QACC_fitness):
         trained_nn, fitness = train_controller(
         DATA / f"{GLOBAL_SEED}_best.csv",
         robot_spec=body,          # ← pass the candidate body
-        duration=5, iterations=2, popsize=3, resume=True
+        duration=5, iterations=100, popsize=5, resume=True
     )
         endbrain = time.time()
         BRAINTIME.append(endbrain-startbrain)
@@ -1542,7 +1542,7 @@ def save_body_json_from_genotype(genotype, num_modules: int, out_path: str | Pat
 
 
     
-def main(action, generations = 1, pop_size = 5,seed = [GLOBAL_SEED]):
+def main(action, generations = 10, pop_size = 5,seed = [GLOBAL_SEED]):
     global WORKING_BODIES
     
     if action == "CMAES":
