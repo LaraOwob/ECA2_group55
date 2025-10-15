@@ -108,23 +108,7 @@ NUM_OF_MODULES = 30
 TARGET_POS = [5, 0, 0.5]
 SPAWN_POS = [-0.8, 0, 0]
 DURATION = 10.0
-################
-#################
-#############
-#IMPORTANT to change!!!!!!!!!!!!!!!!!!!!
-
-GLOBAL_SEED = 55
-
-
-
-
-
-
-
-
-
-
-
+GLOBAL_SEED = 23
 
 
 
@@ -245,45 +229,6 @@ def nn_control_step(nn_obj, m, d, target_pos):
     if len(ACTION_LOG) > 2048:
         ACTION_LOG[:] = ACTION_LOG[-1024:]
     return u
-
-# ---------- Fitness ----------
-'''def evaluate(model: mj.MjModel,
-             world: OlympicArena,
-             nn_obj: NNController,
-             target_pos: np.ndarray = TARGET_POS,
-             duration: float = DURATION) -> float:
-    mj.set_mjcb_control(None)  # important to clear old callbacks
-    data = mj.MjData(model)
-    mj.mj_resetData(model, data)
-
-    bind = _bind_geom_name(model)
-    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_GEOM, name_to_bind=bind)
-    tracker.setup(world.spec, data)
-
-    def _cb(m, d):  # type: ignore # controller callback
-        return nn_control_step(nn_obj, m, d, target_pos)
-    ctrl = Controller(controller_callback_function=_cb, tracker=tracker)
-    mj.set_mjcb_control(ctrl.set_control)
-
-    try:
-        simple_runner(model, data, duration=duration)
-    except Exception as e:
-        print(f"[WARN] Simulation failed: {e}")
-        return -1e6
-
-    path = tracker.history.get("xpos", {})
-    if not path:
-        return -1e6
-    key0 = next(iter(path))
-    traj = np.asarray(path[key0])
-    if traj.size == 0:
-        return -1e6
-
-    start, end = traj[0], traj[-1]
-    progress_x = float(end[0] - start[0])            # forward progress
-    dist_to_target = float(np.linalg.norm(end[:2] - target_pos[:2]))
-    proximity_bonus = max(0.0, 3.0 - dist_to_target) # simple shaping
-    return progress_x + proximity_bonus'''
 
 def morph_sig(model: mj.MjModel) -> str:
     return f"nq{model.nq}_nv{model.nv}_nu{model.nu}"
@@ -475,7 +420,6 @@ def evaluateFitness(model: mj.MjModel,
 def build_world_and_model_at(robot_spec, spawn_pos):
     mj.set_mjcb_control(None)
     world = OlympicArena( load_precompiled=False,)
-    print("print this is spwan",robot_spec)
     world.spawn(robot_spec.spec, position=spawn_pos.tolist(),correct_collision_with_floor=True)
     model = world.spec.compile() #<mujoco._specs.MjSpec object at 0x000001C5019AE370>
 
@@ -499,103 +443,6 @@ def find_robot_root_body(model: mj.MjModel) -> tuple[int, str]:
     # fallback to the world child (usually 1)
     return 1, mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, 1)
 
-
-# ---------- Train (CMA-ES over NN weights) ----------
-'''def train_controller(out_csv: Path, # type: ignore
-                     duration: float = DURATION,
-                     iterations: int = 12,
-                     popsize: int = 16,
-                     hidden: int = 32):
-    world, model = build_world_and_model()
-    nn_obj = NNController(nq=model.nq, nv=model.nv, nu=model.nu, hidden=32, freq_hz=3.0)
-
-    x0 = flatten_params(nn_obj)
-    def obj(x):
-        unflatten_params(nn_obj, x)
-        f = evaluateFitness(model, world, nn_obj,
-                        target_pos=TARGET_POS,
-                        duration=duration)
-        return -f  # CMA-ES minimizes
-
-    es = cma.CMAEvolutionStrategy(x0, 0.8,
-                                  {'popsize': popsize, 'maxiter': iterations,
-                                   'verb_disp': 1, 'verb_log': 0})
-    #es.optimize(obj)
-    history = []
-
-    while not es.stop():
-        xs = es.ask()
-        fs = []
-        for x in xs:
-            unflatten_params(nn_obj, x)
-            f = evaluateFitness(model, world, nn_obj, target_pos=TARGET_POS, duration=duration)
-            fs.append(-f)  # minimize
-        es.tell(xs, fs)
-        best_gen = -float(np.min(fs))
-        history.append(best_gen)
-
-    es.result_pretty()
-    best_x = es.result.xbest
-    best_f = -es.result.fbest
-    unflatten_params(nn_obj, best_x)
-
-    # save curve
-    np.savetxt(DATA / "fitness_curve.csv", np.array(history), delimiter=",")
-
-    best_x = es.result.xbest
-    best_f = -es.result.fbest
-    unflatten_params(nn_obj, best_x)
-
-    # save artifacts
-    DATA.mkdir(parents=True, exist_ok=True)
-    np.save(DATA / "best_controller_params.npy", best_x)
-    with open(out_csv, "w", newline="") as f:
-        csv.writer(f).writerow(["best_fitness"]); csv.writer(f).writerow([best_f])
-
-    # optional: a single frame
-    data = mj.MjData(model)
-    single_frame_renderer(model, data, save=True, save_path=str(DATA / "gecko_frame.png"))
-    print(f"[DONE] Best fitness: {best_f:.3f}. Saved params & frame into {DATA}")
-    return best_f, nn_obj'''
-
-'''def train_controller(out_csv: Path, duration: float = DURATION,
-                     iterations: int = 12, popsize: int = 16, hidden: int = 32):
-    # build scenarios once
-    worlds, models, durations = prepare_scenarios()
-
-    # controller sized to the (identical) gecko model
-    nn_obj = NNController(nq=models[0].nq, nv=models[0].nv, nu=models[0].nu,
-                          hidden=hidden, freq_hz=3.0)
-
-    x0 = flatten_params(nn_obj)
-    es = cma.CMAEvolutionStrategy(x0, 0.8, {
-        'popsize': popsize, 'maxiter': iterations, 'verb_disp': 1, 'verb_log': 0
-    })
-
-    history = []
-    while not es.stop():
-        xs = es.ask()
-        fs = []
-        for x in xs:
-            unflatten_params(nn_obj, x)
-            f_mean = mean_fitness_over_scenarios(nn_obj, worlds, models, durations)
-            fs.append(-f_mean)  # CMA-ES minimizes
-        es.tell(xs, fs)
-        history.append(-float(np.min(fs)))
-
-    es.result_pretty()
-    best_x = es.result.xbest
-    best_f = -es.result.fbest
-    unflatten_params(nn_obj, best_x)
-
-    # save
-    DATA.mkdir(parents=True, exist_ok=True)
-    np.savetxt(DATA / "fitness_curve.csv", np.array(history), delimiter=",")
-    np.save(DATA / "best_controller_params.npy", best_x)
-    with open(out_csv, "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["best_fitness"]); w.writerow([best_f])
-    print(f"[DONE] Best avg fitness over {len(SCENARIOS)} scenarios: {best_f:.3f}")
-    return best_f, nn_obj'''
 
 def train_controller(out_csv: Path,
                      robot_spec,  # <- pass the candidate body spec
@@ -674,36 +521,6 @@ def train_controller(out_csv: Path,
     return nn_obj, best_f
 
 
-# ---------- Visualize ----------
-'''def visualize(mode: ViewerTypes = "launcher", duration: float = DURATION):
-    world, model = build_world_and_model()
-    nn_obj = NNController(nq=model.nq, nv=model.nv, nu=model.nu, hidden=32, freq_hz=3.0)
-    params_path = DATA / "best_controller_params.npy"
-    if not params_path.exists():
-        print(f"[ERR] Missing {params_path}. Run with mode=train first.")
-        return
-    unflatten_params(nn_obj, np.load(params_path))
-
-    def _cb(m, d): return nn_control_step(nn_obj, m, d, TARGET_POS)
-    bind = _bind_geom_name(model)
-    tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_BODY,
-                  name_to_bind=ROBOT_BODY_NAME)
-    data = mj.MjData(model); tracker.setup(world.spec, data)
-    ctrl = Controller(controller_callback_function=_cb, tracker=tracker)
-    mj.set_mjcb_control(ctrl.set_control)
-
-    if mode == "launcher":
-        viewer.launch(model=model, data=data)
-    elif mode == "video":
-        rec = VideoRecorder(output_folder=str(DATA / "videos"))
-        video_renderer(model, data, duration=duration, video_recorder=rec)
-        print(f"[OK] Video saved under {DATA/'videos'}")
-    elif mode == "simple":
-        simple_runner(model, data, duration=duration)
-    elif mode == "frame":
-        single_frame_renderer(model, data, save=True, save_path=str(DATA / "robot.png"))
-        print(f"[OK] Frame saved to {DATA / 'robot.png'}")'''
-
 def visualize(robot_spec,
               mode: Literal["launcher","video","simple","no_control","frame","timestep"]="launcher",
               duration: float = DURATION,
@@ -733,7 +550,7 @@ def visualize(robot_spec,
 
     def _cb(m, d): return nn_control_step(nn_obj, m, d, TARGET_POS)
     #tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_BODY, name_to_bind=ROBOT_BODY_NAME)
-    
+    core = robot_spec
     mujoco_type_to_find = mj.mjtObj.mjOBJ_GEOM
     name_to_bind = "core"
     tracker = Tracker(
@@ -741,11 +558,8 @@ def visualize(robot_spec,
         name_to_bind=name_to_bind,
     )
 
-    
-    
-    data = mj.MjData(model); tracker.setup(world.spec, data)
     ctrl = Controller(controller_callback_function=_cb, tracker=tracker)
-    mj.set_mjcb_control(ctrl.set_control)
+    
     
 
     if mode == "launcher":
@@ -760,8 +574,7 @@ def visualize(robot_spec,
         single_frame_renderer(model, data, save=True, save_path=str(DATA / "robot.png"))
         print(f"[OK] Frame saved to {DATA / 'robot.png'}")
         
-    print(SPAWN_POS)
-    print(tracker.history["xpos"][0])
+ 
     show_xpos_history(
             tracker.history["xpos"][0],
             spawn_position=SPAWN_POS,
@@ -784,63 +597,6 @@ def plot_xy(traj_xy, title="Robot path"):
     plt.axis('equal'); plt.grid(True, alpha=0.3); plt.legend()
     plt.title(title); plt.xlabel("x [m]"); plt.ylabel("y [m]")
     plt.tight_layout(); plt.show()
-
-# ---------- CLI ----------
-# if __name__ == "__main__":
-#     import argparse
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--mode", choices=["train", "visualize"], default="train")
-#     parser.add_argument("--iters", type=int, default=100)
-#     parser.add_argument("--pop", type=int, default=128)
-#     parser.add_argument("--dur", type=float, default=60.0)
-#     parser.add_argument("--viz", choices=["launcher","video","simple","frame"], default="launcher")
-#     parser.add_argument("--scene", type=str, default="rugged",
-#                         help="which scenario to visualize (rugged or uphill)")
-#     parser.add_argument("--resume", action="store_true",
-#                     help="continue training from previous best_controller_params.npy", default=False)
-#     args = parser.parse_args()
-
-#     if args.mode == "train":
-#         train_controller(DATA / "best.csv", duration=args.dur,
-#                      iterations=args.iters, popsize=args.pop,
-#                      resume=args.resume)
-#     else:
-#         visualize(mode=args.viz, duration=args.dur)
-
-########################################
-
-
-
-# ----------------------------
-# Neural Network Controller
-# ----------------------------
-# class NNController(nn.Module):
-#     def __init__(self, nu: int, hidden_size: int = 8):
-#         super().__init__()
-#         self.nu = nu
-#         self.in_dim = nu + 4   # prev_ctrl + sin/cos + delta_x, delta_y
-#         self.hidden = hidden_size
-#         self.out_dim = nu
-
-#         self.fc1 = nn.Linear(self.in_dim, hidden_size)
-#         self.fc2 = nn.Linear(hidden_size, hidden_size)
-#         self.fc3 = nn.Linear(hidden_size, self.out_dim)
-#         self.tanh = nn.Tanh()
-
-#     def forward(self, prev_ctrl: torch.Tensor, t: float, target_pos: torch.Tensor, current_pos: torch.Tensor):
-#         t_tensor = torch.tensor(t, dtype=torch.float32)
-#         w = 2 * torch.pi
-#         delta = target_pos[:2] - current_pos[:2]
-        
-#         # Use t_tensor here
-#         time_features = torch.stack([torch.sin(w * t_tensor), torch.cos(w * t_tensor)])
-        
-#         obs = torch.cat([prev_ctrl, time_features, delta], dim=0)
-#         h = self.tanh(self.fc1(obs))
-#         h = self.tanh(self.fc2(h))
-#         y = self.tanh(self.fc3(h))
-#         return CTRL_RANGE * y
-    
 
 def nn_controller(
     model: mj.MjModel,
@@ -915,19 +671,7 @@ def experiment(
         qacc_fitness = 0
         return None, qacc_fitness, None
     
-    '''# Pass the model and data to the tracker
-    if controller.tracker is not None:
-        controller.tracker.setup(world.spec, data)
-    
-    # Set the control callback function
-    # This is called every time step to get the next action.
-    args: list[Any] = []  # IF YOU NEED MORE ARGUMENTS ADD THEM HERE!
-    kwargs: dict[Any, Any] = {}  # IF YOU NEED MORE ARGUMENTS ADD THEM HERE!
-
-    mj.set_mjcb_control(
-        lambda m, d: controller.set_control(m, d, *args, **kwargs),
-    )'''
-
+  
     # Pass the model and data to the tracker (if any)
     if controller.tracker is not None:
         controller.tracker.setup(world.spec, data)
@@ -991,63 +735,6 @@ def experiment(
                 #else:
                  #   bad_streak = 0
 
-    '''match mode:
-        
-        case "simple":
-            # This disables visualisation (fastest option)
-            simple_runner(
-                model,
-                data,
-                duration=duration,
-            )
-        case "frame":
-            # Render a single frame (for debugging)
-            save_path = str(DATA / "robot.png")
-            single_frame_renderer(model, data, save=True, save_path=save_path)
-        case "video":
-            # This records a video of the simulation
-            path_to_video_folder = str(DATA / "videos")
-            video_recorder = VideoRecorder(output_folder=path_to_video_folder)
-
-            # Render with video recorder
-            video_renderer(
-                model,
-                data,
-                duration=duration,
-                video_recorder=video_recorder,
-            )
-        case "launcher":
-            # This opens a liver viewer of the simulation
-            viewer.launch(
-                model=model,
-                data=data,
-            )
-        case "no_control":
-            # If mj.set_mjcb_control(None), you can control the limbs manually.
-            mj.set_mjcb_control(None)
-            viewer.launch(
-                model=model,
-                data=data,
-            )
-        case "timestep":
-            print("in timestep")
-            # Manually step simulation and check for instability
-            unstable = False
-            num_steps = int(duration / model.opt.timestep)
-            maxQacc = 0
-            for _ in range(num_steps):
-                mj.mj_step(model, data)
-                
-                # Check for NaN, Inf, or huge qacc
-                if (np.any(np.isnan(data.qacc)) or
-                    np.any(np.isinf(data.qacc)) or
-                    np.any(np.abs(data.qacc) > 12000)):
-                    print("Unstable simulation detected! Aborting timestep mode.", max(np.abs(data.qacc)))
-                    return None, max(np.abs(data.qacc))
-                #if np.any(np.abs(data.qacc) > maxQacc):
-                 #   maxQacc =max(np.abs(data.qacc))
-                  #  print(maxQacc)'''
-
     # After simulation — record end position
     end_position = np.copy(data.qpos[:2])  # final x,y
     distance = np.linalg.norm(end_position - start_position)
@@ -1108,17 +795,17 @@ def makeBody(num_modules: int = 20, genotype=None, simulation = "timestep", dura
         # controller_callback_function=random_move,
         tracker=tracker,
     )
-    distance, weirdfitness, traj = experiment(robot=core, controller=ctrl, mode=simulation, duration=duration)
+    distance, alternative_fitness, traj = experiment(robot=core, controller=ctrl, mode=simulation, duration=duration)
 
     if simulation != "timestep":
         plot_xy(traj, "Feasibility run path")
 
-    if weirdfitness is not None and weirdfitness != 0:
+    if alternative_fitness is not None and alternative_fitness != 0:
         # unstable
         print("got weird fitness (unstable feasibility)")
-        return core, weirdfitness
+        return core, alternative_fitness
 
-    if weirdfitness == 0:
+    if alternative_fitness == 0:
         # insufficient body
         print("insufficient body feasibility")
         return core, 0
@@ -1128,45 +815,6 @@ def makeBody(num_modules: int = 20, genotype=None, simulation = "timestep", dura
     return core, None
 
 
-'''def makeIndividual(body,genotype,QACC_fitness):
-    #Create a body
-    #Spawn core to get model, for nu
-    if QACC_fitness:
-        if QACC_fitness == 0:
-            individual ={
-                "genotype": genotype,
-                "robot_spec": body,
-                "nn": None,
-                "fitness": 10
-            }
-        else:
-            individual ={
-                "genotype": genotype,
-                "robot_spec": body,
-                "nn": None,
-                "fitness": QACC_fitness / 10000
-            }
-        return individual
-    else:
-        #Pass numm hinges as inputsize NN 
-        nn_obj = 0
-        #Set target_position
-        target_pos = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-
-        # Train and evaluate
-        
-        trained_nn, fitness = train_controller(DATA / "best.csv", duration= 10,
-                     iterations=5, popsize=5,
-                     resume= False)
-        #train_Net(model, world, nn_obj, core, target_pos, duration = 5.0, iterations=50, lr=0.01)
-        individual ={
-                "genotype": genotype,
-                "robot_spec": body,
-                "nn": trained_nn,
-                "fitness": fitness
-            }
-       
-        return individual'''
 BRAINTIME = []
 def makeIndividual(body, genotype, QACC_fitness):
     global BRAINTIME
@@ -1186,7 +834,6 @@ def makeIndividual(body, genotype, QACC_fitness):
     )
         endbrain = time.time()
         BRAINTIME.append(endbrain-startbrain)
-        print(f"THE TIME FOR A BRAIN IS {BRAINTIME}\n\n\n\n\n\n\n\n")
         return {
             "genotype": genotype,
             "robot_spec": body,
@@ -1325,7 +972,6 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
 
     # Initialize population by sampling normal distribution with mean 0 and stdv of init_scale
     pop,fits = initializePopulation(pop_size=pop_size, num_modules=20)
-    print("made population")
     #Finds best fitnesses
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     best_idx = int(np.argmax(fits))
@@ -1369,10 +1015,6 @@ def train_mlp_de(out_csv, generations=100, pop_size=30, T=10.0, seed=0, model=No
             if gen_best > best_fit:
                 best_fit = gen_best
                 best_candidate = pop[int(np.argmax(fits))].copy()
-
-            #Print every after every 10th generation
-            #if (g + 1) % max(1, generations // 10) == 0:
-                #print(f"[mlp_de seed {seed}] Gen {g+1}/{generations}: best={gen_best:.3f} mean={gen_mean:.3f}")
 
     return best_candidate, best_fit
 
@@ -1425,14 +1067,12 @@ def plot(file_path,output_path):
     
     
 def load_series(csv_path):
-    print(csv_path)
     df = pd.read_csv(csv_path)
     return df["best_fitness"].to_numpy()
 
 
 def plot_experiment(exp_name, exp_csvs, final_exp ,out_png, window=10, title=None, xlabel="Generation", ylabel="Fitness"):
     # Load runs
-    print(exp_csvs)
     exp_runs = [load_series(p) for p in exp_csvs]
     if len(exp_runs) == 0:
         print(f"[plot] No runs found for {exp_name}")
@@ -1540,7 +1180,6 @@ def save_body_json_from_genotype(genotype, num_modules: int, out_path: str | Pat
     save_graph_as_json(robot_graph, str(out_path))
 
 
-
     
 def main(action, generations = 10, pop_size = 5,seed = [GLOBAL_SEED]):
     global WORKING_BODIES
@@ -1560,7 +1199,6 @@ def main(action, generations = 10, pop_size = 5,seed = [GLOBAL_SEED]):
             #simulate core quickly to see if it is feasible
             print(f"CMAES found {len(WORKING_BODIES)} bodies in total \n\n\n")
         if best_candidate_CMAES["robot_spec"]:
-            print("find a body")
             makeBody(genotype = best_candidate_CMAES["genotype"], simulation = "launcher", duration = 15)
     
     if action == "DE":
@@ -1592,7 +1230,6 @@ def main(action, generations = 10, pop_size = 5,seed = [GLOBAL_SEED]):
             
     if action == "plot CMAES":
         exp_csvs = sorted(glob.glob(f"./results/CMAES/CMAES_{generations}_{pop_size}_seed*.csv"))
-        print(exp_csvs)
         plot_experiment(exp_name = "CMAES",
                         exp_csvs=exp_csvs,
                         final_exp=False,
@@ -1601,17 +1238,15 @@ def main(action, generations = 10, pop_size = 5,seed = [GLOBAL_SEED]):
                         title="fitness of CMAES over generations")
     if action == "plot DE":
         exp_csvs = sorted(glob.glob(f"./results_{GLOBAL_SEED}/DE/DE{generations}_{pop_size}_seed*.csv"))
-        print(exp_csvs)
         plot_experiment(exp_name = "DE",
                         exp_csvs=exp_csvs,
                         final_exp=False,
-                        out_png=f"./results/plotsA3/DE{generations}_{pop_size}.png",
+                        out_png=f"./results_{GLOBAL_SEED}/plotsA3/DE{generations}_{pop_size}.png",
                         window=10,
                         title="fitness of DE over generations")
-    print(f"all the braintimes {BRAINTIME}")
   
     
 if __name__ == "__main__":
-    action = "DE" # 'plot CMAES', 'plot DE', 'DE', 'CMAES'
+    action = "plot DE" # 'plot CMAES', 'plot DE', 'DE', 'CMAES'
     main(action)
     
