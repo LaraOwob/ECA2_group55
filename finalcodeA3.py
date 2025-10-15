@@ -1600,7 +1600,7 @@ def main(action, generations = 10, pop_size = 5,seed = [GLOBAL_SEED]):
                         window=10,
                         title="fitness of CMAES over generations")
     if action == "plot DE":
-        exp_csvs = sorted(glob.glob(f"./results/DE/DE{generations}_{pop_size}_seed*.csv"))
+        exp_csvs = sorted(glob.glob(f"./results_{GLOBAL_SEED}/DE/DE{generations}_{pop_size}_seed*.csv"))
         print(exp_csvs)
         plot_experiment(exp_name = "DE",
                         exp_csvs=exp_csvs,
